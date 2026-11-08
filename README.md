@@ -81,9 +81,13 @@ Install on Apple Silicon macOS or on Linux with an NVIDIA GPU:
 curl -fsSL https://github.com/wici-ai/inferssd/releases/latest/download/install.sh | sh
 ```
 
-InferSSD currently installs from source, so the engine is compiled for your machine's CPU and GPU; prebuilt packages are not available yet. Building takes about 2 to 12 minutes, depending on the machine.
+A release's installer builds that release from source, so the engine is compiled for your machine's CPU and GPU. Building takes about 2 to 12 minutes, depending on the machine. On an Apple Silicon Mac with macOS 15 or later, the installer on `main` instead downloads a prebuilt package of `main`, about 30 MB, which needs no developer tools; see [the macOS package](docs/macos-package.md):
 
-The installer works in a private environment and uses no `sudo`. It needs Git, Python 3.9 or later, and a C/C++ compiler. macOS also needs the Xcode Command Line Tools; Linux also needs systemd with cgroup v2, and the CUDA toolkit on a machine with an NVIDIA GPU. Follow the printed PATH instruction if it shows one.
+```sh
+curl -fsSL https://raw.githubusercontent.com/wici-ai/inferssd/main/scripts/install.sh | sh
+```
+
+The installer works in a private environment and uses no `sudo`. A source build needs Git, Python 3.9 or later, and a C/C++ compiler. On macOS it also needs the Xcode Command Line Tools; Linux also needs systemd with cgroup v2, and the CUDA toolkit on a machine with an NVIDIA GPU. Follow the printed PATH instruction if it shows one.
 
 Then start a model:
 
@@ -100,6 +104,28 @@ For Muse, use `unsloth/Muse-Spark-Open-816B-A42B-GGUF`; for Qwen3.6, `unsloth/Qw
 The first run downloads the model files (about 470 GiB for DeepSeek or Muse, 21 GiB for Qwen3.6) to `~/.local/share/inferssd/models` and measures your machine. Use `--model-dir /path/on/ssd` to choose the drive, or `-m /path/to/first-shard.gguf` for files you already have. There is no memory setting to choose: InferSSD uses the memory available. Stop with **Ctrl+C**, or `/exit` in chat.
 
 See the [quick start](docs/quickstart.md#one-command-installation) for upgrades and uninstalling.
+
+## Versions
+
+InferSSD has a release number, `0.1.3` in `framework/pyproject.toml`, and every build has a
+label of its own, `<yymmdd>.<build>.<commit>`: the day (UTC) of the commit it was built from, the
+branch's commit count up to that commit, and the commit. The installer records the three in
+`engine-resources.json` beside the build, from the clone's Git metadata, and so does a local
+build that runs `scripts/engine-resources.py`; a source archive has no Git metadata and records
+none. A [macOS package](docs/macos-package.md) carries those of the commit it was built from
+and is named by its label. `inferssd --version` prints the release and the label, `inferssd --version --json` every
+field:
+
+```sh
+$ inferssd --version
+inferssd 0.1.3 (261106.202.03af979)
+$ inferssd --version --json
+{"version": "0.1.3", "build": 202, "revision": "03af97…", "date": "2026-11-06", "branch": "main", "label": "261106.202.03af979"}
+```
+
+The engine only says what it is. Whether a build is one it can work with is for whatever runs
+the engine to decide; the WiCi AI desktop app, for one, installs `main`, offers its newer
+builds as updates, and keeps a floor of its own on `build`. Nothing here refers to it.
 
 ## Further reading
 

@@ -733,7 +733,8 @@ static uint64_t triplet_bytes(const fixture & f) {
 static kimi_cpu_sink_cache_stats cache_snapshot(kimi_cpu_sink * sink) {
     kimi_cpu_sink_cache_stats stats = {};
     kimi_cpu_sink_cache_get_stats(sink, &stats);
-    require(stats.capacity_bytes <= stats.budget_bytes && stats.mapped_bytes <= stats.capacity_bytes &&
+    // A cache sized from the room maps every slot it may grow into (mapped_bytes) and holds capacity_bytes of them.
+    require(stats.capacity_bytes <= stats.budget_bytes && stats.committed_bytes <= stats.capacity_bytes &&
             stats.enabled_bytes <= stats.capacity_bytes && stats.committed_bytes <= stats.mapped_bytes &&
             stats.valid_bytes <= stats.committed_bytes && stats.valid_bytes <= stats.enabled_bytes,
             "cache physical budget invariant failed");
@@ -741,8 +742,25 @@ static kimi_cpu_sink_cache_stats cache_snapshot(kimi_cpu_sink * sink) {
     return stats;
 }
 
+// A case that caches up to `bytes` on macOS or Windows, where the envelope is the machine itself, needs room for them
+// in the host ledger's terms: a busy machine lacks it, as one without a finite cgroup lacks the envelope on Linux,
+// whose runner gives the cases a cgroup sized for them (and whose pressure cases configure what it cannot hold). An
+// automatic budget sizes itself from the room, and a budget past the machine's memory is a pressure case.
+static void need_cache_room(uint64_t bytes) {
+#if defined(__linux__)
+    (void) bytes;
+#else
+    uint64_t machine = 0;
+    if (bytes == UINT64_MAX || !ssd::host::native::physical(machine) || bytes >= machine) { return; }
+    ssd::host::native_ledger ledger;
+    test_resources::need(ledger.measure(bytes).fits(),
+            "cache case needs room for its budget beyond the floor (the machine's memory is taken)");
+#endif
+}
+
 static void configure_cache(kimi_cpu_sink * sink, uint64_t bytes,
         const std::vector<int32_t> & layers, int quota) {
+    need_cache_room(bytes);
     char error[512] = {};
     require(kimi_cpu_sink_cache_configure(sink, bytes, layers.data(), int(layers.size()), quota, error, sizeof(error)),
             std::string("cache configure: ") + error);
@@ -1931,6 +1949,8 @@ static void cache_pressure_test(fixture_inputs & inputs, int threads, int depth,
     }
     test_resources::need(unbounded ? !finite : constrained, unbounded ? "--cache-unbounded requires no finite cgroup ancestor" :
             "--cache-pressure requires a cgroup memory.max <= 2 GiB (use an independent 1 GiB scope)");
+    // a reserve the scope cannot hold beside the payload
+    scoped_fixture_input reserve(inputs, "cache_reserve_bytes", std::to_string(2ull << 30).c_str());
     fixture f; make_synthetic(f); auto sink = make_sink(inputs, f, threads, depth);
     std::vector<float> input(f.latent, .13f);
     configure_cache(sink.get(), 2 * triplet_bytes(f), { 1 }, 2);
@@ -2802,8 +2822,9 @@ static void cache_load_tests(fixture_inputs & inputs, int threads, int depth) {
         std::printf("case=prefill_room status=PASS %s | %s\n", line.c_str(), regrow.c_str());
     }
     {
-        // The load step with a prefill's pages held (the load-time graph's): the arena has the slots the first decode
-        // token would size, the slots committed leave the pages' room, and those are owed at the first decode token.
+        // The load step with a prefill's pages held (the load-time graph's): the arena has every slot the layers' quotas
+        // allow, the slots the first decode token would size are enabled, the slots committed leave the pages' room,
+        // and those are owed at the first decode token.
         scoped_fixture_input file_env(inputs, "cache_reclaimable_file", "1");
         auto number = [](const std::string & line, const std::string & key) {
             const size_t at = line.find(" " + key + "=");
@@ -2837,9 +2858,10 @@ static void cache_load_tests(fixture_inputs & inputs, int threads, int depth) {
             }
             require(ok, error);
         }
-        require(number(loaded, "of") == 6 && number(loaded, "slots") == 3,
-                "load hold: the arena or the committed slots did not leave the held pages: " + loaded);
         const uint64_t stride = number(loaded, "slot_bytes");
+        require(number(loaded, "of") == 2 * 6 && number(loaded, "slots") == 3 &&
+                cache_snapshot(g.get()).enabled_bytes == 6 * stride,
+                "load hold: the arena, the enabled or the committed slots did not leave the held pages: " + loaded);
         begin_cache(g.get(), 14, 1, false);
         require(cache_snapshot(g.get()).enabled_bytes == 6 * stride, "load hold: the first prefill gave held slots back");
         begin_cache(g.get(), 14, 2);
@@ -3019,7 +3041,8 @@ static void work_buffer_reclaim_tests(fixture_inputs & inputs, int threads, int 
     const auto state = client->state();
     require(bool(state) && state.value.pending_bytes == 0 && state.value.granted == granted + work,
             "work buffer: the ledger kept a pending debit or did not grant the buffer");
-    require(client->measure(0, true).value.fits(), "work buffer: the grant overdrew the envelope");
+    // the envelope, a hard limit (the system term moves with the rest of the machine)
+    require(client->measure(0, true).value.cgroup_shortage == 0, "work buffer: the grant overdrew the envelope");
 
     begin_cache(sink.get(), 21, 2); // the first decode token takes back what the room allows now
     tensors meta(f, 1);
@@ -3814,7 +3837,8 @@ static bool same_bits(const std::vector<float> & a, const std::vector<float> & b
 // SiLU-gated experts as qwen4exp routes them (separate up/gate/down, softmax top-10, sum-normalized weights)
 // through sink nodes on a ggml threadpool of 1, 2, an odd count and all CPUs, against reference_swiglu_graph,
 // compared with memcmp: two chained decode layers with a dense op between, and grouped prefills. Shapes: the model's
-// (Q8_0, 2560 -> 640 -> 2560, 512 experts, of which the fixture holds 12), a narrow Q8_0 one for prefills of 2 to
+// (Q8_0 or mixed IQ1_S/IQ4_NL, 2560 -> 640 -> 2560, 512 experts, of which the fixture holds 12),
+// a narrow Q8_0 one for prefills of 2 to
 // 2048 tokens, and a BF16 one whose hidden width of 70 leaves a scalar tail at every fixed vector width.
 static void swiglu_tests(fixture_inputs & inputs, int depth) {
     const kimi_cpu_sink_activation swiglu = { KIMI_CPU_SINK_ACTIVATION_SWIGLU, 0.0f, 0.0f, 0.0f, nullptr, 0.0f };
@@ -3824,15 +3848,16 @@ static void swiglu_tests(fixture_inputs & inputs, int depth) {
     constexpr int nslots = 10;
     struct shape {
         const char * name;
-        ggml_type type;
+        ggml_type type, down_type;
         int latent, hidden, experts;
         std::vector<int32_t> stored;
         std::vector<int> prefill_tokens;
     };
     const std::vector<shape> shapes = {
-        { "q8_0_model", GGML_TYPE_Q8_0, 2560, 640, 512, { 0, 7, 64, 129, 200, 255, 256, 333, 400, 450, 501, 511 }, { 2, 65 } },
-        { "q8_0_narrow", GGML_TYPE_Q8_0, 256, 96, 48, {}, { 2, 64, 65, 300, 2048 } },
-        { "bf16_tail", GGML_TYPE_BF16, 64, 70, 24, {}, { 2, 65, 300 } },
+        { "q8_0_model", GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 2560, 640, 512, { 0, 7, 64, 129, 200, 255, 256, 333, 400, 450, 501, 511 }, { 2, 65 } },
+        { "iq1_s_iq4_nl_model", GGML_TYPE_IQ1_S, GGML_TYPE_IQ4_NL, 2560, 640, 512, { 0, 7, 64, 129, 200, 255, 256, 333, 400, 450, 501, 511 }, { 2, 65 } },
+        { "q8_0_narrow", GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 256, 96, 48, {}, { 2, 64, 65, 300, 2048 } },
+        { "bf16_tail", GGML_TYPE_BF16, GGML_TYPE_BF16, 64, 70, 24, {}, { 2, 65, 300 } },
     };
     std::mt19937 rng(20261028);
     std::normal_distribution<float> sample(0.0f, 0.3f);
@@ -3851,7 +3876,7 @@ static void swiglu_tests(fixture_inputs & inputs, int depth) {
     };
     for (const auto & s : shapes) {
         fixture f;
-        f.type = f.down_type = s.type; f.latent = s.latent; f.hidden = s.hidden; f.experts = s.experts; f.stored = s.stored;
+        f.type = s.type; f.down_type = s.down_type; f.latent = s.latent; f.hidden = s.hidden; f.experts = s.experts; f.stored = s.stored;
         make_synthetic(f, 20261028);
         tensors meta1(f, 1), meta2(f, 2);
         std::vector<float> x(f.latent);

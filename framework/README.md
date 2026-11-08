@@ -46,7 +46,7 @@ CUDA GPU it
 also chooses `prefill.cpu_max_tokens`, the longest prompt pass the CPU prefills
 no slower than the GPU graph, and prefills each prompt in one pass (`-b` and
 `-ub` as large as the context); on a GPU that shares host memory it keeps
-`host.headroom_mib = 4096`, and on macOS a quarter of the machine's memory. It fills only settings left at their registry
+`host.headroom_mib = 4096`. It fills only settings left at their registry
 defaults and thread options and sizes not given, so explicit values always win.
 The choices are written to the generated `settings.ssd` with `source=strategy`
 receipts and to `strategy.json`, with the values your settings kept and the
@@ -144,11 +144,11 @@ contract.
 
 ## How serve and cli run the server
 
-`inferssd serve` and `cli` resolve the launch for Linux or macOS from the live
+`inferssd serve` and `cli` resolve the launch for Linux, macOS or Windows from the live
 machine, then start one supervised server on a loopback port. Each launch writes
 a resource policy for the whole machine, `memory_budget_bytes` set to its
 physical memory, and claims a new run directory under
-`~/.local/share/inferssd/state/runs`. Windows is not supported yet.
+`~/.local/share/inferssd/state/runs`.
 
 On Linux the server runs in a systemd scope with cgroup v2 whose memory limit is
 `memory_budget_bytes`, with zero swap and readable ancestor OOM counters and
@@ -156,8 +156,14 @@ memory peak; see the [Linux requirements](../docs/quickstart.md#linux-requiremen
 The worker checks the actual envelope and the server's inherited scope and
 memlock limit. It never raises system limits.
 
+On Windows the server runs in its guardian's job object, whose commit limit is
+`memory_budget_bytes` plus the dedicated memory of the discrete GPUs, since WDDM
+charges their allocations to commit; the worker checks that limit and that the
+server stays in the job. Paging-file use and the memory compression store are system-wide, so
+their growth is sampled, as on macOS.
+
 On macOS the budget is a **sampled soft server RSS threshold**, not a cgroup or a
-hard unified-memory cap. Both platforms monitor while the
+hard unified-memory cap. Every platform is monitored while the
 server runs, and fail the execution if a threshold or the worker fails. Host
 utility calls have a ten-second timeout. These checks do not replace per-host
 validation or prove a model will fit.
