@@ -2,6 +2,8 @@
 
 #include "cpu-sink.h"
 #include <cmath>
+#include <cstdint>
+#include <functional>
 #include "ggml-ssd/telemetry/telemetry.h"
 
 // Matches mul(weight) followed by ggml_rms_norm, which squares in float and sums in double, then route scaling.
@@ -51,11 +53,6 @@ struct kimi_cpu_sink_prefill_batch {
     double gpu_worker_us;
     double gpu_expert_us;    // the GPU's time in its expert chains
     double gpu_read_wait_us; // the GPU worker's wait for streamed SSD reads
-    uint64_t gpu_cold_admit_candidates;
-    uint64_t gpu_cold_admit_experts;
-    uint64_t gpu_cold_admit_routes;
-    uint64_t gpu_cold_admit_upload_bytes;
-    double gpu_cold_admit_upload_us;
     uint64_t ram_experts;
     uint64_t ram_routes;
     uint64_t ram_bytes;
@@ -66,6 +63,10 @@ struct kimi_cpu_sink_prefill_batch {
 
 void kimi_cpu_sink_parallel(struct kimi_cpu_sink * sink,
         kimi_cpu_sink_parallel_fn function, void * userdata);
+// Runs grow, which allocates and first touches `bytes` of host memory outside the caches, under a ticket of the sink's
+// host-memory context: the ledger makes room for them (the RAM cache gives slots back) and refuses only what the
+// envelope cannot hold, as the sink's own scratch is priced. Throws the refusal; call outside a run.
+void kimi_cpu_sink_host_grow(struct kimi_cpu_sink * sink, uint64_t bytes, const std::function<void()> & grow);
 void kimi_cpu_sink_parallel_last(struct kimi_cpu_sink * sink,
         kimi_cpu_sink_parallel_fn function, void * userdata);
 bool kimi_cpu_sink_stream_hybrid(struct kimi_cpu_sink * sink,

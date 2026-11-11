@@ -32,16 +32,13 @@ struct llama_kimi_cpu_sink_node {
     llama_kimi_cpu_sink_runtime * runtime;
     float situ_beta;
     float situ_linear_beta;
-    // SITU nodes keep the K3 entries (run, cache compute, grouped prefill).
+    // SITU nodes keep the K3 entries (run, grouped prefill).
     // Other activations are decode-only through kimi_cpu_sink_run_activation.
     kimi_cpu_sink_activation activation = { KIMI_CPU_SINK_ACTIVATION_SITU, 0.0f, 0.0f, 0.0f };
     int layer;
     bool post_exp_norm = false;
     float post_exp_norm_eps = 0.0f;
     bool prefill = false;
-    bool cache_compute = false;
-    bool guarded = false;
-    float routed_scale = 1.0f;
 };
 
 struct llama_kimi_cpu_sink_runtime {
@@ -55,12 +52,10 @@ struct llama_kimi_cpu_sink_runtime {
     llama_kimi_cpu_prefill_runtime prefill;
     decltype(&kimi_cpu_sink_run) run = nullptr;
     decltype(&kimi_cpu_sink_run_activation) run_activation = nullptr;
-    decltype(&kimi_cpu_sink_run_cache_compute) run_cache_compute = nullptr;
-    bool cache_compute_enabled = false;
-    kimi_cache_compute_config cache_compute_config = {};
     decltype(&kimi_cpu_sink_destroy) destroy = nullptr;
     decltype(&kimi_cpu_sink_cache_configure) cache_configure = nullptr;
     decltype(&kimi_cpu_sink_cache_begin) cache_begin = nullptr;
+    decltype(&kimi_cpu_sink_request_begin) request_begin = nullptr;
     decltype(&kimi_cpu_sink_vram_phase_complete) vram_phase_complete = nullptr;
     decltype(&kimi_cpu_sink_cache_get_stats) cache_get_stats = nullptr;
     decltype(&ssd::cpu::cache_make_room_configured) cache_make_room = nullptr; // optional
@@ -83,11 +78,12 @@ struct llama_kimi_cpu_sink_runtime {
     // experts while the current layer's node is active: name -> (bytes per expert, experts).
     std::map<std::string, std::pair<size_t, int64_t>> expert_shapes;
     decltype(&kimi_cpu_sink_prefetch_hint) prefetch_hint = nullptr; // optional
+    decltype(&kimi_cpu_sink_prefill_hint) prefill_hint = nullptr;
     bool sequence_known = false;
     llama_seq_id sequence = 0;
     bool cache_decode_active = false;
     // A prefill phase is open from a prefill begin() until phase_complete(true) or a decode begin(); the graph
-    // reserves inside it repeat the request-boundary transition and are skipped.
+    // reserves inside it repeat the request-boundary transition and are skipped. begin_request() opens a new one.
     bool prefill_open = false;
     bool cache_keep_across_requests = false;
     // The file pages the weight rows of the last prefill graph reserved gather (prefill_room): the load step leaves
@@ -101,7 +97,7 @@ struct llama_kimi_cpu_sink_runtime {
         : settings(configured), services(runtime_services), source(source_view), epoch(context_epoch) {
         if (n_expert <= 0) { throw std::runtime_error("CPU sink requires a positive routed expert count"); }
         // Supported v0.1 profile: resource-sized RAM cache, model-order priority,
-        // fixed eight-expert read ring, no speculative cache-compute policy.
+        // fixed eight-expert read ring.
         cache_budget = std::numeric_limits<uint64_t>::max();
         cache_keep_across_requests = true;
         vram_budget = settings.vram_budget()->tier_bytes(services.gpu != nullptr);
@@ -131,10 +127,9 @@ struct llama_kimi_cpu_sink_runtime {
     static bool resolve_source(void * userdata, const char * tensor_name, int32_t expert,
             kimi_cpu_sink_source * source) {
         auto & runtime = *static_cast<llama_kimi_cpu_sink_runtime *>(userdata);
-        if (!runtime.active_node || !runtime.source.resolve || !source) {
+        if (!runtime.source.resolve || !source) {
             return false;
         }
-        const auto & node = *runtime.active_node;
         auto range = [&](size_t logical_nbytes, int64_t experts) {
             *source = {};
             if (!runtime.source.resolve(runtime.source.userdata, tensor_name, expert, logical_nbytes, experts,
@@ -146,9 +141,12 @@ struct llama_kimi_cpu_sink_runtime {
             source->nbytes = (source->data_offset + logical_nbytes + 4095) / 4096 * 4096;
             return true;
         };
-        for (const ggml_tensor * tensor : { &node.up, &node.gate, &node.down }) {
-            if (std::strcmp(tensor_name, tensor->name) == 0) {
-                return range(tensor->nb[2], tensor->ne[2]);
+        // the running node's tensors first; any routed layer's otherwise (the next layer's prefetch, the load's preload)
+        if (const auto * node = runtime.active_node) {
+            for (const ggml_tensor * tensor : { &node->up, &node->gate, &node->down }) {
+                if (std::strcmp(tensor_name, tensor->name) == 0) {
+                    return range(tensor->nb[2], tensor->ne[2]);
+                }
             }
         }
         const auto shape = runtime.expert_shapes.find(tensor_name);
@@ -197,9 +195,11 @@ struct llama_kimi_cpu_sink_runtime {
         destroy = cpu_api->destroy;
         cache_configure = cpu_api->cache_configure;
         cache_begin = cpu_api->cache_begin;
+        request_begin = cpu_api->request_begin;
         vram_phase_complete = cpu_api->vram_phase_complete;
         cache_get_stats = cpu_api->cache_get_stats;
         prefetch_hint = cpu_api->prefetch_hint;
+        prefill_hint = cpu_api->prefill_hint;
         constexpr int ring_experts = 8;
         char error[512] = {};
         sink = create(&settings, &services, resolve_source, this, error, sizeof(error));
@@ -222,6 +222,13 @@ struct llama_kimi_cpu_sink_runtime {
     void prepare_graph(ggml_backend_reg_t registry) {
         std::lock_guard<std::mutex> lock(mutex);
         initialize(registry);
+    }
+
+    // The threads of the decode pool (`pool`) a decode graph with sink nodes runs on, after prepare_graph: the pool
+    // less the CPUs the machine's other work takes (kimi_cpu_sink_decode_threads).
+    int decode_threads(int pool) {
+        std::lock_guard<std::mutex> lock(mutex);
+        return cpu_api->decode_threads(sink, pool);
     }
 
     void print_cache_stats(const char * reason, bool decode, uint64_t token) {
@@ -253,17 +260,30 @@ struct llama_kimi_cpu_sink_runtime {
 
     void begin(ggml_backend_reg_t registry, uint64_t token, bool decode, llama_seq_id seq = 0) {
         std::lock_guard<std::mutex> lock(mutex);
+        transition(registry, token, decode, seq, false);
+    }
+    // A request's prefill boundary (llama_ssd_prefill_phase): a new prefill phase, also when one is open. A prompt
+    // evaluated outside any request leaves its phase open, since no decode token follows it: the server evaluates two
+    // tokens at load to probe sequence removal, and its first request would otherwise run inside that phase.
+    void begin_request() {
+        std::lock_guard<std::mutex> lock(mutex);
+        transition(nullptr, 0, false, 0, true);
+    }
+    // Requires mutex.
+    void transition(ggml_backend_reg_t registry, uint64_t token, bool decode, llama_seq_id seq, bool request) {
         const bool observe = services.debug && (services.debug->trace || services.debug->profile);
         if (!cache_budget && !vram_budget && !observe) { return; }
         if (decode) { initialize(registry); }
-        if (!sink || (!decode && prefill_open)) { return; }
+        if (!sink || (!decode && prefill_open && !request)) { return; }
         char error[512] = {};
         if (decode && sequence_known && sequence != seq) {
             if (!cache_begin(sink, epoch, token, false, error, sizeof(error))) {
                 GGML_ABORT("CPU sink cache sequence reset failed: %s; no fallback", error);
             }
         }
-        if (!cache_begin(sink, epoch, token, decode, error, sizeof(error))) {
+        const bool begun = request ? request_begin(sink, epoch, error, sizeof(error)) :
+            cache_begin(sink, epoch, token, decode, error, sizeof(error));
+        if (!begun) {
             GGML_ABORT("CPU sink cache phase/token transition failed: %s; no fallback", error);
         }
         sequence_known = decode;
@@ -301,6 +321,18 @@ struct llama_kimi_cpu_sink_runtime {
         if (reserve && !reserve(sink, experts.data(), int(experts.size() / 3), experts_used, error, sizeof(error))) {
             std::fprintf(stderr, "[kimi_vram_elastic] event=reserve status=fail error=%s\n", error);
         }
+    }
+
+    // At load, after the load's passes and before any request: the expert caches filled from the drive by the sink
+    // (kimi_cpu_sink_preload). Nothing to do before the sink exists (no reserve made it). experts: up, gate and down
+    // of every routed layer.
+    bool preload(const std::vector<const ggml_tensor *> & experts, std::string & error) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!sink || !cpu_api || experts.size() < 3) { return true; }
+        char message[512] = {};
+        if (cpu_api->preload(sink, experts.data(), int(experts.size() / 3), message, sizeof(message))) { return true; }
+        error = message;
+        return false;
     }
 
     // Room for `host_bytes` of host memory and `device_bytes` of GPU memory the caller is about to allocate, from
@@ -402,8 +434,13 @@ inline void llama_kimi_cpu_sink_compute(ggml_tensor * dst, int ith, int nth, voi
         activation.post_exp_norm_eps = node.post_exp_norm_eps;
     }
     const bool situ = node.activation.kind == KIMI_CPU_SINK_ACTIVATION_SITU;
-    GGML_ASSERT(situ || !node.cache_compute);
     if (node.prefill) {
+        // the next layer's predicted experts for every token, for the sink's read-ahead
+        if (const ggml_tensor * hint = dst->src[4]; hint && runtime.prefill_hint) {
+            GGML_ASSERT(hint->type == GGML_TYPE_I32 && ggml_is_contiguous(hint) && hint->ne[1] == ntokens);
+            runtime.prefill_hint(runtime.sink, node.layer + 1, static_cast<const int32_t *>(hint->data), ntokens,
+                static_cast<int>(hint->ne[0]));
+        }
         runtime.prefill.initialize(node.cpu_reg, runtime.sink);
         ok = runtime.prefill.run_activation(runtime.prefill.context, &node.up, &node.gate, &node.down,
             static_cast<const float *>(input->data), static_cast<const int32_t *>(ids->data),
@@ -411,19 +448,6 @@ inline void llama_kimi_cpu_sink_compute(ggml_tensor * dst, int ith, int nth, voi
             &activation, static_cast<float *>(dst->data),
             &grouped_stats, error, sizeof(error));
         stats = grouped_stats.stream;
-    } else if (node.cache_compute) {
-        GGML_ASSERT(ntokens == 1 && runtime.run_cache_compute);
-        const ggml_tensor * native_ids = dst->src[3];
-        const ggml_tensor * native_weights = dst->src[4];
-        GGML_ASSERT(native_ids && native_ids->type == GGML_TYPE_I32 && ggml_is_contiguous(native_ids));
-        GGML_ASSERT(native_weights && native_weights->type == GGML_TYPE_F32 && ggml_is_contiguous(native_weights));
-        GGML_ASSERT(ggml_nelements(native_ids) == ggml_nelements(native_weights));
-        ok = runtime.run_cache_compute(runtime.sink, &node.up, &node.gate, &node.down,
-            static_cast<const float *>(input->data), static_cast<const int32_t *>(ids->data),
-            static_cast<const float *>(weights->data), nslots,
-            static_cast<const int32_t *>(native_ids->data), static_cast<const float *>(native_weights->data),
-            int(ggml_nelements(native_ids)), node.routed_scale, node.guarded, &runtime.cache_compute_config,
-            node.situ_beta, node.situ_linear_beta, static_cast<float *>(dst->data), &stats, nullptr, error, sizeof(error));
     } else if (situ) {
         GGML_ASSERT(ntokens == 1);
         ok = runtime.run(runtime.sink, &node.up, &node.gate, &node.down,
@@ -434,7 +458,7 @@ inline void llama_kimi_cpu_sink_compute(ggml_tensor * dst, int ith, int nth, voi
     } else {
         GGML_ASSERT(ntokens == 1);
         // the next layer's predicted experts, for the sink's prefetch
-        if (const ggml_tensor * hint = dst->src[5]; hint && runtime.prefetch_hint) {
+        if (const ggml_tensor * hint = dst->src[4]; hint && runtime.prefetch_hint) {
             GGML_ASSERT(hint->type == GGML_TYPE_I32 && ggml_is_contiguous(hint));
             runtime.prefetch_hint(runtime.sink, node.layer + 1, static_cast<const int32_t *>(hint->data),
                 static_cast<int>(ggml_nelements(hint)));
@@ -473,9 +497,6 @@ inline void llama_kimi_cpu_sink_compute(ggml_tensor * dst, int ith, int nth, voi
                 " gpu_ssd_transient_candidates=%" PRIu64 " gpu_ssd_transient_experts=%" PRIu64
                 " gpu_ssd_transient_routes=%" PRIu64 " gpu_ssd_transient_upload_bytes=%" PRIu64
                 " gpu_ssd_transient_upload_us=%.3f"
-                " gpu_cold_admit_candidates=%" PRIu64 " gpu_cold_admit_experts=%" PRIu64
-                " gpu_cold_admit_routes=%" PRIu64 " gpu_cold_admit_upload_bytes=%" PRIu64
-                " gpu_cold_admit_upload_us=%.3f"
                 " ram_experts=%" PRIu64 " ram_routes=%" PRIu64 " ram_bytes=%" PRIu64
                 " ssd_experts=%" PRIu64 " ssd_routes=%" PRIu64 " ssd_bytes=%" PRIu64 "\n",
                 node.layer, ntokens, nslots, stats.experts, grouped_stats.routed_slots,
@@ -487,9 +508,6 @@ inline void llama_kimi_cpu_sink_compute(ggml_tensor * dst, int ith, int nth, voi
                 grouped_stats.gpu_ssd_transient_candidates, grouped_stats.gpu_ssd_transient_experts,
                 grouped_stats.gpu_ssd_transient_routes, grouped_stats.gpu_ssd_transient_upload_bytes,
                 grouped_stats.gpu_ssd_transient_upload_us,
-                grouped_stats.gpu_cold_admit_candidates, grouped_stats.gpu_cold_admit_experts,
-                grouped_stats.gpu_cold_admit_routes, grouped_stats.gpu_cold_admit_upload_bytes,
-                grouped_stats.gpu_cold_admit_upload_us,
                 grouped_stats.ram_experts, grouped_stats.ram_routes, grouped_stats.ram_bytes,
                 grouped_stats.ssd_experts, grouped_stats.ssd_routes, grouped_stats.ssd_bytes);
         }

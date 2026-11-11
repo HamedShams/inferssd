@@ -547,8 +547,13 @@ void prefill_lane_info(void * context, kimi_vram_prefill_lane * out) {
     out->in_place = 1;
     out->post_norm = 1;
 }
-const kimi_vram_prefill_api prefill_table = { 9, sizeof(kimi_vram_prefill_api), prefill_prepare, prefill_transient_available, prefill_launch,
-    prefill_finish, tier_cancel, prefill_cold_active, prefill_admit_cold, prefill_lane_info };
+// No slot table: nothing to seed.
+int prefill_seed_routes(void *, const int32_t *, int, char *, size_t) { return 0; }
+int prefill_seed_host(void *, int32_t, const void *, const void *, const void *, char *, size_t) { return 0; }
+int prefill_seed_wait(void *, int32_t, char *, size_t) { return 0; }
+const kimi_vram_prefill_api prefill_table = { 10, sizeof(kimi_vram_prefill_api), prefill_prepare, prefill_transient_available, prefill_launch,
+    prefill_finish, tier_cancel, prefill_cold_active, prefill_admit_cold, prefill_lane_info,
+    prefill_seed_routes, prefill_seed_host, prefill_seed_wait };
 
 int elastic_phase_complete(void * context, int decode, char *, size_t) {
     if (decode) { self(context)->drain(); self(context)->release_work(); }
@@ -562,7 +567,14 @@ int elastic_reserve(void * context, const kimi_vram_request *, const kimi_vram_e
     self(context)->learn_format(*format);
     return 0;
 }
-const kimi_vram_elastic_api elastic_table = { 4, sizeof(kimi_vram_elastic_api), elastic_phase_complete, elastic_reserve_accumulate, elastic_reserve };
+// The graph lane keeps no expert of its own: nothing to preload.
+int elastic_preload_slots(void *, int * slots, char *, size_t) { *slots = 0; return 0; }
+int elastic_preload(void *, const kimi_vram_request *, const void *, const void *, const void *, int * copied, char *, size_t) {
+    *copied = 0;
+    return 0;
+}
+const kimi_vram_elastic_api elastic_table = { 5, sizeof(kimi_vram_elastic_api), elastic_phase_complete, elastic_reserve_accumulate,
+    elastic_reserve, elastic_preload_slots, elastic_preload };
 
 int host_available(void *) { return 0; }
 int host_launch(void *, const kimi_vram_host_job *, int, int * accepted, char *, size_t) { *accepted = 0; return 0; }
@@ -608,8 +620,8 @@ void * no_stream(ggml_backend_t) { return nullptr; }
 
 const provider_v1 * graph_lane_provider() {
     static const provider_v1 provider = {
-        1, sizeof(provider_v1),
-        &tier_table, nullptr, nullptr, nullptr, &prefill_table, &elastic_table, nullptr,
+        2, sizeof(provider_v1),
+        &tier_table, nullptr, nullptr, &prefill_table, &elastic_table, nullptr,
         &host_table, nullptr, &settings_table, nullptr, nullptr,
         device_is_unified, device_ordinal, attach_services, no_stream,
     };

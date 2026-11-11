@@ -205,8 +205,7 @@ llama_context::llama_context(
         if (cparams.n_ubatch > uint32_t(std::numeric_limits<int>::max() / 16)) {
             throw std::runtime_error("grouped CPU prefill ubatch exceeds route index range");
         }
-        cpu_prefill_max_tokens = uint32_t(*ssd_runtime->settings.integer("prefill.cpu_max_tokens"));
-        cpu_prefill_request_max_tokens = cpu_prefill_max_tokens;
+        cpu_prefill_hint = *ssd_runtime->settings.integer("prefill.lookahead") != 0;
     }
     // The retained resource profile sizes each request's prompt graph, then
     // keeps a one-token decode graph. The configured ubatch remains available
@@ -317,13 +316,13 @@ llama_context::llama_context(
                 cpu_sink_runtime = std::make_unique<llama_kimi_cpu_sink_runtime>(model.hparams.n_layer,
                     kimi_cpu_sink_context_epoch.fetch_add(1, std::memory_order_relaxed),
                     int64_t(model.hparams.n_expert), routed_layers, ssd_runtime->settings, ssd_runtime->services, ssd_runtime->sources);
-                if (*ssd_runtime->settings.integer("prefetch.depth") > 0) {
-                    for (uint32_t il = 0; il < model.hparams.n_layer; ++il) {
-                        const auto & layer = model.layers[il];
-                        for (const ggml_tensor * experts : {layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps}) {
-                            if (experts) {
-                                cpu_sink_runtime->expert_shapes[ggml_get_name(experts)] = {experts->nb[2], experts->ne[2]};
-                            }
+                // every routed layer's expert shapes: what resolves a layer other than the running one's experts (the
+                // next layer's decode prefetch and prefill read-ahead, the load's preload)
+                for (uint32_t il = 0; il < model.hparams.n_layer; ++il) {
+                    const auto & layer = model.layers[il];
+                    for (const ggml_tensor * experts : {layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps}) {
+                        if (experts) {
+                            cpu_sink_runtime->expert_shapes[ggml_get_name(experts)] = {experts->nb[2], experts->ne[2]};
                         }
                     }
                 }
@@ -455,14 +454,8 @@ llama_context::llama_context(
         // cache's elsewhere when it can give room back; the sink decides): its page population then leaves every
         // request's path. Every routed layer, for each layer's expert format (a model may quantize layers differently).
         if (cpu_sink_runtime && (cpu_sink_runtime->vram_budget || cpu_sink_runtime->cache_budget) && backend_cpu) {
-            std::vector<const ggml_tensor *> experts;
-            for (const auto & layer : model.layers) {
-                if (layer.ffn_up_exps && layer.ffn_gate_exps && layer.ffn_down_exps) {
-                    experts.insert(experts.end(), { layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps });
-                }
-            }
             cpu_sink_runtime->reserve_tier(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu)),
-                experts, int(model.hparams.n_expert_used));
+                routed_experts(), int(model.hparams.n_expert_used));
         }
 
         if (!cparams.flash_attn) {
@@ -616,7 +609,7 @@ void llama_context::sched_reserve() {
 
     const uint32_t n_seqs = cparams.n_seq_max;
     const uint32_t n_tokens = kimi_cpu_sink_reserve_tokens(cparams,
-        cpu_sink_enabled && cpu_sink_decode_active && !cparams.warmup);
+        cpu_sink_enabled && cpu_sink_decode_active);
     if (n_tokens < std::min(cparams.n_ctx, cparams.n_ubatch)) {
         LLAMA_LOG_INFO("[kimi_cpu_sink_decode_reserve] tokens=%u configured_ubatch=%u\n",
             n_tokens, cparams.n_ubatch);
@@ -936,21 +929,6 @@ bool llama_context::moe_prefill_phase_workspace(bool active, uint32_t requested_
     auto complete_vram_phase = [&](bool decode) {
         return !cpu_sink_runtime || !cpu_sink_runtime->vram_budget || cpu_sink_runtime->phase_complete(decode);
     };
-    // One line per prefill with the expert copies of its graph-route passes: what they read, how fast, and whether
-    // a read fell back to a slower path.
-    if (active || prefill_copy.passes > 0) {
-        // the scheduler reads a split's experts before it launches the split: the passes' reads are all counted
-        ggml_backend_sched_kimi_copy_stats now = {};
-        ggml_backend_sched_kimi_copy_stats_get(sched.get(), &now);
-        if (active) {
-            prefill_copy.begin(now);
-        } else {
-            if (ssd_runtime && !ssd_runtime->diagnostics.prefill_copy(
-                    now.bytes - prefill_copy.start.bytes, now.read_us - prefill_copy.start.read_us,
-                    prefill_copy.passes, prefill_copy.tokens)) { return false; }
-            LLAMA_LOG_INFO("%s\n", prefill_copy.end(now).c_str());
-        }
-    }
     // One line per request phase with the copies of the weights homed on the drive: a request's start ends the
     // previous phase and begins its prefill, the prefill's end begins its decode, the request's end ends that
     {
@@ -973,7 +951,7 @@ bool llama_context::moe_prefill_phase_workspace(bool active, uint32_t requested_
     // prompts. Release before every early return or prefill workspace reserve.
     if (active && cpu_sink_runtime) {
         if (sched) { synchronize(); }
-        cpu_sink_runtime->begin(nullptr, 0, false);
+        cpu_sink_runtime->begin_request();
         cpu_sink_cache_batch_decode = false;
     }
     const bool graph_phase_gate_enabled = dense_gpu_phase_gate_enabled;
@@ -1043,12 +1021,8 @@ bool llama_context::moe_prefill_phase_workspace(bool active, uint32_t requested_
             // A smaller graph when the request's own does not fit: the normal batch allocator splits the prompt into
             // physical ubatches, and each one streams its layers' expert union from the SSD again
             // (llama_prefill_ubatch_search).
-            cpu_prefill_request_max_tokens = cpu_prefill_max_tokens;
-            const uint32_t fallback = llama_prefill_ubatch_search(target, cpu_prefill_graph_granularity,
-                cpu_prefill_request_max_tokens,
-                [&](uint32_t n, uint32_t max_tokens) { return cpu_sink_prefill_route(n, max_tokens); },
-                reserve_ubatch);
-            if (fallback == target && cpu_prefill_request_max_tokens == cpu_prefill_max_tokens) {
+            const uint32_t fallback = llama_prefill_ubatch_search(target, cpu_prefill_graph_granularity, reserve_ubatch);
+            if (fallback == target) {
                 cpu_prefill_actual_shape_active = true;
                 cpu_prefill_selected_ubatch = target;
                 if (ssd_runtime && !ssd_runtime->diagnostics.prefill_graph(
@@ -1066,19 +1040,13 @@ bool llama_context::moe_prefill_phase_workspace(bool active, uint32_t requested_
                 cpu_prefill_selected_ubatch = fallback;
                 if (ssd_runtime && !ssd_runtime->diagnostics.prefill_graph(
                         prefill_tokens, 0, fallback)) { return false; }
-                char max_tokens[16] = "all";
-                if (cpu_prefill_request_max_tokens != std::numeric_limits<uint32_t>::max()) {
-                    snprintf(max_tokens, sizeof(max_tokens), "%u", cpu_prefill_request_max_tokens);
-                }
                 LLAMA_LOG_WARN(
                     "[kimi_cpu_prefill_graph] event=fallback requested_tokens=%u target_ubatch=%u "
-                    "selected_ubatch=%u route=%s max_sink_tokens=%s transition_ms=%.3f\n",
-                    prefill_tokens, target, fallback, cpu_sink_prefill_route(fallback) ? "sink" : "graph",
-                    max_tokens, (ggml_time_us() - transition_start_us) / 1000.0);
+                    "selected_ubatch=%u transition_ms=%.3f\n",
+                    prefill_tokens, target, fallback, (ggml_time_us() - transition_start_us) / 1000.0);
                 return complete_vram_phase(false);
             }
 
-            cpu_prefill_request_max_tokens = cpu_prefill_max_tokens;
             const bool decode_restored = reserve_ubatch(1);
             cpu_prefill_selected_ubatch = 0;
             complete_vram_phase(decode_restored);
@@ -1096,7 +1064,6 @@ bool llama_context::moe_prefill_phase_workspace(bool active, uint32_t requested_
             return reserved && vram_complete;
         }
         const uint32_t released = cpu_prefill_selected_ubatch;
-        cpu_prefill_request_max_tokens = cpu_prefill_max_tokens;
         const bool graph_restored = reserve_ubatch(1);
         cpu_prefill_actual_shape_active = false;
         cpu_prefill_selected_ubatch = 0;
@@ -1202,7 +1169,7 @@ bool llama_context::memory_update(bool optimize) {
 
         const uint32_t n_seqs = cparams.n_seq_max;
         const uint32_t n_tokens = kimi_cpu_sink_reserve_tokens(cparams,
-            cpu_sink_enabled && cpu_sink_decode_active && !cparams.warmup);
+            cpu_sink_enabled && cpu_sink_decode_active);
 
         auto * gf = graph_reserve(n_tokens, n_seqs, n_tokens, mctx.get());
         if (!gf) {
@@ -1575,6 +1542,9 @@ void llama_context::set_causal_attn(bool value) {
 void llama_context::set_warmup(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
+    // A warmup routes every token to every expert, to page the weights in. The SSD sink reads the experts a pass
+    // routes to from the drive and keeps them in its own caches: there a warmup is an ordinary pass.
+    value = value && !cpu_sink_enabled;
     if (cparams.warmup == value) {
         return;
     }
@@ -1708,10 +1678,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     if (cpu_sink_decode_active && ubatch.n_tokens > 1 && !cpu_sink_multi_token_reported) {
-        // the sink decodes one token at a time and the prefill route is for prefill: a larger decode ubatch (a draft
-        // to verify) runs ggml's MUL_MAT_ID where the scheduler puts it
-        LLAMA_LOG_WARN("[kimi_cpu_sink] n_tokens=%u in decode runs ggml's MUL_MAT_ID %s; the sink decodes one token\n",
-            ubatch.n_tokens, gpu_offloads_experts(ubatch.n_tokens) ? "on the GPU" : "on the CPU over the mapped experts");
+        // the sink decodes one token at a time and its grouped prefill is for prefill: a larger decode ubatch (a draft
+        // to verify) runs ggml's MUL_MAT_ID over the mapped experts, where the scheduler puts it
+        LLAMA_LOG_WARN("[kimi_cpu_sink] n_tokens=%u in decode runs ggml's MUL_MAT_ID over the mapped experts; "
+            "the sink decodes one token\n", ubatch.n_tokens);
         cpu_sink_multi_token_reported = true;
     }
 
@@ -1729,19 +1699,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     if (dense_stream.phase != nullptr) {
         dense_stream.add(ubatch.n_tokens);
     }
-    if (cpu_sink_enabled && !cpu_sink_decode_active && !cparams.warmup) {
-        char max_tokens[16] = "all";
-        if (cpu_prefill_request_max_tokens != std::numeric_limits<uint32_t>::max()) {
-            snprintf(max_tokens, sizeof(max_tokens), "%u", cpu_prefill_request_max_tokens);
-        }
-        LLAMA_LOG_INFO("[kimi_prefill_route] n_tokens=%u route=%s max_sink_tokens=%s offloads=%d\n",
-            ubatch.n_tokens, gparams.cpu_sink_prefill ? "sink" : "graph", max_tokens,
-            gpu_offloads_experts(ubatch.n_tokens) ? 1 : 0);
-        if (!gparams.cpu_sink_prefill) {
-            prefill_copy.pass(ubatch.n_tokens);
-        }
-    }
-
     if (!graph_reuse_disable && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
@@ -2196,8 +2153,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
 
-    cpu_sink_cache_batch_decode = cpu_sink_enabled && cpu_sink_decode_active &&
-        !cparams.warmup && n_tokens_all == 1;
+    cpu_sink_cache_batch_decode = cpu_sink_enabled && cpu_sink_decode_active && n_tokens_all == 1;
     const bool cpu_sink_non_decode_phase = !cpu_sink_cache_batch_decode && cpu_sink_runtime &&
         (cpu_sink_runtime->cache_budget || cpu_sink_runtime->vram_budget);
 
@@ -3015,118 +2971,60 @@ std::string llama_dense_stream_meter::end(const ggml_backend_sched_kimi_copy_sta
     return line;
 }
 
-std::string llama_prefill_copy_meter::end(const ggml_backend_sched_kimi_copy_stats & now) {
-    if (passes == 0) {
-        return {};
-    }
-    const uint64_t bytes = now.bytes - start.bytes;
-    const uint64_t read_us = now.read_us - start.read_us;
-    char line[256];
-    snprintf(line, sizeof(line), "[moe_prefill_copy] tokens=%" PRIu64 " passes=%u expert_slices=%" PRIu64 " bytes=%"
-        PRIu64 " read_us=%" PRIu64 " read_gbs=%.2f fallbacks=%" PRIu64, tokens, passes,
-        now.expert_slices - start.expert_slices, bytes, read_us, read_us ? bytes / 1e3 / read_us : 0.0,
-        now.fallbacks - start.fallbacks);
-    passes = 0;
-    tokens = 0;
-    return line;
-}
-
-bool llama_gpu_offloads_mul_mat_id(const std::vector<ggml_backend_dev_t> & gpus,
-        const std::vector<const ggml_tensor *> & experts, int64_t n_expert_used, uint32_t n_tokens) {
-    if (gpus.empty() || experts.empty() || n_tokens == 0) {
-        return false;
-    }
-    // the op over each expert tensor, without data: the tests read only types, shapes and buffers
-    const ggml_init_params params = { (1 + 2 * experts.size()) * ggml_tensor_overhead(), nullptr, true };
-    ggml_context_ptr ctx { ggml_init(params) };
-    ggml_tensor * ids = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, n_expert_used, n_tokens);
-    std::vector<const ggml_tensor *> ops;
-    for (const ggml_tensor * as : experts) {
-        ggml_tensor * b = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, as->ne[0], 1, n_tokens);
-        ops.push_back(ggml_mul_mat_id(ctx.get(), const_cast<ggml_tensor *>(as), b, ids));
-    }
-    for (ggml_backend_dev_t dev : gpus) {
-        if (std::all_of(ops.begin(), ops.end(), [&](const ggml_tensor * op) {
-                return ggml_backend_dev_supports_op(dev, op) && ggml_backend_dev_offload_op(dev, op); })) {
-            return true;
-        }
-    }
-    return false;
-}
-
-bool llama_context::gpu_offloads_experts(uint32_t n_tokens) const {
-    if (!cparams.op_offload) {
-        return false;
-    }
-    std::vector<ggml_backend_dev_t> gpus;
-    for (const auto & backend : backends) {
-        ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
-        const auto type = dev ? ggml_backend_dev_type(dev) : GGML_BACKEND_DEVICE_TYPE_CPU;
-        if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
-            gpus.push_back(dev);
-        }
-    }
-    // one expert tensor of each type and buffer type: the test depends on them, not on the layer
-    auto buft = [](const ggml_tensor * t) { return t->buffer ? ggml_backend_buffer_get_type(t->buffer) : nullptr; };
+// up, gate and down of every routed layer, in layer order
+std::vector<const ggml_tensor *> llama_context::routed_experts() const {
     std::vector<const ggml_tensor *> experts;
     for (const auto & layer : model.layers) {
-        for (const ggml_tensor * t : { layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps, layer.ffn_gate_up_exps }) {
-            if (t && std::none_of(experts.begin(), experts.end(), [&](const ggml_tensor * e) {
-                    return e->type == t->type && buft(e) == buft(t); })) {
-                experts.push_back(t);
-            }
+        if (layer.ffn_up_exps && layer.ffn_gate_exps && layer.ffn_down_exps) {
+            experts.insert(experts.end(), { layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps });
         }
     }
-    return llama_gpu_offloads_mul_mat_id(gpus, experts, model.hparams.n_expert_used, n_tokens);
+    return experts;
 }
 
-bool llama_context::cpu_sink_prefill_route(uint32_t n_tokens) const {
-    return cpu_sink_prefill_route(n_tokens, cpu_prefill_request_max_tokens);
+bool llama_context::ssd_preload() {
+    if (!cpu_sink_runtime || !(cpu_sink_runtime->vram_budget || cpu_sink_runtime->cache_budget)) {
+        return true;
+    }
+    // The load ends as a request's prefill does: in the decode phase, the graph reserved for one token. The caches
+    // then fill the memory a request leaves them between its prefills, and each prefill takes back what its own
+    // graph needs (it reserves the graph for its prompt; the GPU tier gives blocks back on demand). Left with the
+    // graph the context was made with (the configured ubatch, 8192 tokens: 4.5 GB on an RTX 5090), the tier grew
+    // into what was left of the card and kept the 2.3 GB a 4,104-token prompt's graph does not use free all
+    // through the first prefill.
+    if (!moe_prefill_phase_workspace(false, 0, 0)) {
+        LLAMA_LOG_WARN("%s: the decode graph could not be reserved before the preload\n", __func__);
+    }
+    synchronize();
+    std::string error;
+    if (!cpu_sink_runtime->preload(routed_experts(), error)) {
+        LLAMA_LOG_WARN("%s: SSD expert preload failed: %s\n", __func__, error.c_str());
+        return false;
+    }
+    return true;
 }
 
-bool llama_context::cpu_sink_prefill_route(uint32_t n_tokens, uint32_t max_tokens) const {
-    return llama_cpu_sink_prefill_route(cpu_sink_enabled, max_tokens, n_tokens,
-        cpu_sink_enabled && n_tokens > max_tokens && gpu_offloads_experts(n_tokens));
-}
-
-uint32_t llama_prefill_ubatch_search(uint32_t target, uint32_t granularity, uint32_t & max_sink_tokens,
-        const std::function<bool(uint32_t, uint32_t)> & sink_route, const std::function<bool(uint32_t)> & reserve) {
+uint32_t llama_prefill_ubatch_search(uint32_t target, uint32_t granularity, const std::function<bool(uint32_t)> & reserve) {
     if (reserve(target)) {
         return target;
     }
     const uint32_t step = std::min<uint32_t>(std::max<uint32_t>(256, granularity), std::max<uint32_t>(1, target / 2));
-    // the largest size in (lo, target) that reserve accepts, and the smallest it refused; with graph, a size that
-    // takes the sink is below every graph size (the route is monotone in the size)
-    auto largest = [&](uint32_t lo, bool graph) {
-        uint32_t found = 0, failed = target;
-        while (failed > lo + step) {
-            uint32_t probe = lo + (failed - lo) / 2;
-            probe = std::max(lo + step, probe - probe % step);
-            if (probe >= failed) { break; }
-            if (graph && sink_route(probe, max_sink_tokens)) {
-                lo = probe;
-            } else if (reserve(probe)) {
-                lo = found = probe;
-            } else {
-                failed = probe;
-            }
-        }
-        return std::make_pair(found, failed);
-    };
-    if (!sink_route(target, max_sink_tokens)) {
-        if (const uint32_t graph = largest(std::min(max_sink_tokens, target), true).first) {
-            return graph;
-        }
-        max_sink_tokens = target;
-        if (reserve(target)) {
-            return target;
+    // the largest size in (0, target) that reserve accepts, and the smallest it refused
+    uint32_t lo = 0, found = 0, failed = target;
+    while (failed > lo + step) {
+        uint32_t probe = lo + (failed - lo) / 2;
+        probe = std::max(lo + step, probe - probe % step);
+        if (probe >= failed) { break; }
+        if (reserve(probe)) {
+            lo = found = probe;
+        } else {
+            failed = probe;
         }
     }
-    const auto [sink, failed] = largest(0, false);
-    if (!sink && failed > 1 && reserve(1)) {
+    if (!found && failed > 1 && reserve(1)) {
         return 1;
     }
-    return sink;
+    return found;
 }
 
 llm_graph_params llama_context::graph_params(
@@ -3148,8 +3046,9 @@ llm_graph_params llama_context::graph_params(
         /*.cross       =*/ &cross,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
-        /*.cpu_sink_decode =*/ cpu_sink_enabled && cpu_sink_decode_active && !cparams.warmup,
-        /*.cpu_sink_prefill =*/ !cpu_sink_decode_active && !cparams.warmup && cpu_sink_prefill_route(ubatch.n_tokens),
+        /*.cpu_sink_decode =*/ cpu_sink_enabled && cpu_sink_decode_active,
+        /*.cpu_sink_prefill =*/ cpu_sink_enabled && !cpu_sink_decode_active,
+        /*.cpu_sink_prefill_hint =*/ cpu_prefill_hint,
         /*.cpu_sink_runtime =*/ cpu_sink_runtime.get(),
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
@@ -3182,6 +3081,8 @@ ggml_status llama_context::graph_compute(
             LLAMA_LOG_ERROR("%s: %s; no fallback\n", __func__, e.what());
             return GGML_STATUS_FAILED;
         }
+        // Decode runs on the pool's threads that the machine's other work leaves a CPU each; the others wait.
+        if (!batched) { n_threads = cpu_sink_runtime->decode_threads(n_threads); }
     }
 
     // set the number of threads for all the backends
@@ -4175,6 +4076,13 @@ bool llama_ssd_prefill_phase(llama_context * ctx, bool active,
     try { return ctx && ctx->moe_prefill_phase_workspace(active, prompt_tokens, prefill_tokens); }
     catch (const std::exception & failure) { LLAMA_LOG_ERROR("SSD phase transition failed: %s\n", failure.what()); }
     catch (...) { LLAMA_LOG_ERROR("SSD phase transition failed\n"); }
+    return false;
+}
+
+bool llama_ssd_preload(llama_context * ctx) {
+    try { return ctx && ctx->ssd_preload(); }
+    catch (const std::exception & failure) { LLAMA_LOG_ERROR("SSD expert preload failed: %s\n", failure.what()); }
+    catch (...) { LLAMA_LOG_ERROR("SSD expert preload failed\n"); }
     return false;
 }
 

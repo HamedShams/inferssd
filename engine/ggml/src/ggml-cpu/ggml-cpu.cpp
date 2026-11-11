@@ -702,7 +702,7 @@ static ggml_backend_feature * ggml_backend_cpu_get_features(ggml_backend_reg_t r
 
 static const ssd::cpu::api_v2 * ggml_backend_cpu_ssd_api_v2() {
     static const ssd::cpu::api_v2 api = {
-        3, sizeof(ssd::cpu::api_v2),
+        7, sizeof(ssd::cpu::api_v2),
         &kimi_cpu_sink_source_size,
         &ssd::cpu::create_configured,
         &kimi_cpu_sink_run,
@@ -711,14 +711,18 @@ static const ssd::cpu::api_v2 * ggml_backend_cpu_ssd_api_v2() {
         &kimi_cpu_sink_call_open,
         &kimi_cpu_sink_call_close,
         &kimi_cpu_sink_call_join,
+        &kimi_cpu_sink_decode_threads,
         &kimi_cpu_sink_cache_configure,
         &kimi_cpu_sink_cache_begin,
+        &kimi_cpu_sink_request_begin,
         &kimi_cpu_sink_vram_phase_complete,
         &kimi_cpu_sink_cache_get_stats,
         &ssd::cpu::cache_make_room_configured,
         &ssd::cpu::cache_prefill_room_configured,
         &kimi_cpu_sink_prefetch_hint,
+        &kimi_cpu_sink_prefill_hint,
         &kimi_cpu_sink_vram_reserve,
+        &kimi_cpu_sink_preload,
         &kimi_cpu_prefill_create,
         &kimi_cpu_prefill_run,
         &kimi_cpu_prefill_run_activation,
@@ -752,11 +756,6 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     if (strcmp(name, "kimi_cpu_sink_create") == 0) {
         return (void *) kimi_cpu_sink_create;
     }
-    if (strcmp(name, "kimi_cpu_sink_set_cache_locations") == 0) { return (void *) kimi_cpu_sink_set_cache_locations; }
-    if (strcmp(name, "kimi_cpu_sink_run_cache_compute") == 0) { return (void *) kimi_cpu_sink_run_cache_compute; }
-    if (strcmp(name, "kimi_cache_compute_config_from_env") == 0) { return (void *) kimi_cache_compute_config_from_env; }
-    if (strcmp(name, "kimi_cache_compute_plan_init") == 0) { return (void *) kimi_cache_compute_plan_init; }
-    if (strcmp(name, "kimi_cache_compute_plan_update") == 0) { return (void *) kimi_cache_compute_plan_update; }
     if (strcmp(name, "kimi_cpu_sink_run") == 0) {
         return (void *) kimi_cpu_sink_run;
     }
@@ -768,6 +767,9 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (strcmp(name, "kimi_cpu_sink_cache_begin") == 0) {
         return (void *) kimi_cpu_sink_cache_begin;
+    }
+    if (strcmp(name, "kimi_cpu_sink_request_begin") == 0) {
+        return (void *) kimi_cpu_sink_request_begin;
     }
     if (strcmp(name, "kimi_cpu_sink_vram_phase_complete") == 0) {
         return (void *) kimi_cpu_sink_vram_phase_complete;

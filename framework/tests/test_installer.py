@@ -3,6 +3,7 @@
 
 import os
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -163,7 +164,7 @@ def test_mac_asks_for_the_command_line_tools(installation):
 
 
 def test_release_workflow_can_pin_the_installer():
-    # .github/workflows/release.yml rewrites exactly this line to the tag.
+    # Numbered release asset preparation rewrites exactly this line to the tag.
     assert re.search(r"^DEFAULT_REF=main$", INSTALLER.read_text(), re.M)
 
 
@@ -178,17 +179,52 @@ WINDOWS_INSTALLER = INSTALLER.with_name("install.ps1")
 
 
 def test_release_workflow_can_pin_the_windows_installer():
-    # .github/workflows/release.yml rewrites exactly this line to the tag.
+    # Numbered release asset preparation rewrites exactly this line to the tag.
     assert re.search(r"^\$DefaultRef = 'main'$", WINDOWS_INSTALLER.read_text(), re.M)
 
 
 def test_windows_installer_builds_the_preset_the_framework_looks_in():
     text = WINDOWS_INSTALLER.read_text()
-    assert "cmake --preset windows-llvm" in text
-    # The same targets as the POSIX installer on a machine without a CUDA GPU.
-    assert "--target inferssd-server inferssd-cpuprobe inferssd-ssdprobe" in text
+    # CUDA for an NVIDIA GPU, as the POSIX installer builds linux-cuda; else Vulkan or the CPU.
+    assert "$preset = 'windows-llvm'" in text and "$preset = 'windows-cuda'" in text
+    assert '"cmake --preset $preset$vulkan || exit /b 1"' in text
+    assert '"cmake --build build-$preset --parallel $jobs --target $targets || exit /b 1"' in text
+    # The same targets as the POSIX installer, the GPU memory probe only with CUDA.
+    assert "$targets = 'inferssd-server inferssd-cpuprobe inferssd-ssdprobe'" in text
+    assert "$targets += ' inferssd-memprobe'" in text
     for name in ("INFERSSD_HOME", "INFERSSD_BIN_DIR", "INFERSSD_REF", "INFERSSD_JOBS"):
         assert name in text and name in INSTALLER.read_text()
+
+
+def test_windows_installer_keeps_selected_branch_history_for_build_number(tmp_path):
+    source, installed = tmp_path / "source repository", tmp_path / "installed source"
+
+    def git(*args, cwd=None):
+        return subprocess.check_output(["git", *args], cwd=cwd, text=True).strip()
+
+    git("init", "--initial-branch=main", str(source))
+    git("config", "user.name", "Installer test", cwd=source)
+    git("config", "user.email", "installer@example.test", cwd=source)
+    git("config", "commit.gpgsign", "false", cwd=source)
+    for index in range(3):
+        if index == 1:
+            git("checkout", "-b", "model-support", cwd=source)
+        (source / "version.txt").write_text(str(index))
+        git("add", "version.txt", cwd=source)
+        git("commit", "-m", f"Build {index}", cwd=source)
+
+    command = next(
+        line.strip()[2:]
+        for line in WINDOWS_INSTALLER.read_text().splitlines()
+        if line.strip().startswith("& git clone ")
+    )
+    values = {"$ref": "model-support", "$repository": source.as_uri(), "$source": str(installed)}
+    # file:// makes Git honor a shallow clone, reproducing the old build=1 bug.
+    subprocess.run([values.get(word, word) for word in shlex.split(command)], check=True)
+    assert git("rev-list", "--count", "HEAD", cwd=installed) == "3"
+    assert git("rev-parse", "--is-shallow-repository", cwd=installed) == "false"
+    assert git("branch", "--show-current", cwd=installed) == "model-support"
+    assert (installed / "version.txt").read_text() == "2"
 
 
 def package_name(label):
@@ -261,6 +297,24 @@ def test_mac_installs_the_package_without_developer_tools(installation, tmp_path
     assert current.parent.parent == home.resolve() / "releases"
     descriptor = subprocess.check_output([str(bindir / "inferssd"), "serve", "--help"], text=True)
     assert Path(descriptor.strip()) == current / "engine-resources.json"
+    called = set(Path(env["CALL_LOG"]).read_text().split())
+    assert not called & {"git", "cc", "c++", "xcode-select", "python3", "cmake"}
+
+
+@posix_installer
+def test_tagged_mac_installer_still_uses_its_prebuilt_package(installation, tmp_path):
+    home, _, env = installation
+    text = INSTALLER.read_text().replace("DEFAULT_REF=main", "DEFAULT_REF=v0.1.3")
+    result = subprocess.run(
+        ["sh"],
+        input=text,
+        text=True,
+        env=dict(env, INFERSSD_PACKAGES=make_package(tmp_path, "261107.207.84bcc56")),
+        capture_output=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "Downloading InferSSD" in result.stdout and "Building" not in result.stdout
+    assert home.joinpath("current").is_dir()
     called = set(Path(env["CALL_LOG"]).read_text().split())
     assert not called & {"git", "cc", "c++", "xcode-select", "python3", "cmake"}
 

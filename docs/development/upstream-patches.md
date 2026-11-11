@@ -8,12 +8,12 @@ preserves its source attribution and license files.
 
 | Integration group | Reason and boundary |
 | --- | --- |
-| ggml scheduler and allocator | Borrowed SSD copy hooks; graph buffer measurement/admission; first touch; backend scratch reservation; a pass that keeps an in-place op with the backend holding its storage. No core implementation is linked into ggml-base. |
-| CPU/CUDA registries | Normal private provider discovery and context-service attachment. CPU and CUDA do not link each other. |
+| ggml scheduler and allocator | Borrowed SSD copy hooks for the weights homed on the drive; graph buffer measurement/admission; first touch; backend scratch reservation; a pass that keeps an in-place op with the backend holding its storage. No core implementation is linked into ggml-base. |
+| CPU/CUDA registries | Normal private provider discovery and context-service attachment. CPU and CUDA do not link each other. On Windows the CUDA backend loads the driver's nvcuda.dll on first use, so a CUDA build starts where no NVIDIA driver is. |
 | Vulkan backend | Idle-submit keepalive every 20 ms; source-aware F16 `SET_ROWS` pipelines for F32/F16 destinations and I32/I64 indices, with unsupported conversions rejected. Shared copy shaders retain their F32 source variants. |
 | Backend operation files | New model operations and narrow native kernel entry points stay with their upstream operation/architecture files. Strict MXFP4 math is compiled separately with contraction and FTZ disabled. |
 | llama context | Runtime assembly, request phases, resource-aware graph reservation and failure recovery. Source, cache and telemetry owners reside in `src/ssd`. |
-| Model loading/mapping | Deferred expert ranges and compact Metal allocations where a GGUF interleaves the dense tensors with experts held elsewhere; fixed complete-page advice. Source/range helpers reside in `src/ssd`. |
+| Model loading/mapping | Deferred expert ranges and compact Metal allocations where a GGUF interleaves the dense tensors with experts held elsewhere; under mmap, the tensors copied into a device buffer read with direct I/O into pinned buffers where the files read direct, as without mmap; fixed complete-page advice; read-ahead of the rows a lookup table (Engram, PLE) is about to read, on every OS; a refusal of GPU weights larger than the device's free memory. Source/range helpers reside in `src/ssd`. |
 | Model/architecture support | DeepSeek V4.1, Engram, Muse and Qwen3.8-Flash-Next (qwen4exp) architecture, metadata, graph and KV operations follow upstream model/op organization. They are intentional model exceptions. |
 | Common/server | CLI dispatch, rendering/parser hooks, prompt-cache/checkpoint and lifecycle calls. Owned implementations reside in `common/inferssd` and `tools/server/inferssd`. |
 | State serialization | Virtual/C API entry points call positional/range codecs under `src/inferssd`. |
@@ -38,19 +38,20 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `common/chat-auto-parser-generator.cpp` | 1 | 1 |
 | `common/chat-peg-parser.cpp` | 4 | 2 |
 | `common/chat-peg-parser.h` | 3 | 0 |
-| `common/chat.cpp` | 175 | 199 |
-| `common/chat.h` | 34 | 3 |
+| `common/chat.cpp` | 244 | 199 |
+| `common/chat.h` | 46 | 3 |
 | `common/common.cpp` | 3 | 1 |
 | `common/common.h` | 13 | 2 |
 | `common/debug.cpp` | 16 | 13 |
 | `common/download.cpp` | 2 | 2 |
 | `common/hf-cache.cpp` | 1 | 1 |
 | `common/jinja/caps.cpp` | 1 | 1 |
-| `common/jinja/parser.cpp` | 10 | 2 |
-| `common/jinja/runtime.cpp` | 6 | 1 |
+| `common/jinja/parser.cpp` | 17 | 4 |
+| `common/jinja/runtime.cpp` | 67 | 1 |
+| `common/jinja/runtime.h` | 18 | 0 |
 | `common/jinja/string.cpp` | 16 | 5 |
 | `common/jinja/string.h` | 5 | 6 |
-| `common/jinja/value.cpp` | 170 | 133 |
+| `common/jinja/value.cpp` | 189 | 133 |
 | `common/jinja/value.h` | 17 | 18 |
 | `common/peg-parser.cpp` | 16 | 0 |
 | `common/peg-parser.h` | 4 | 0 |
@@ -62,30 +63,30 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `common/speculative.h` | 6 | 0 |
 | `ggml/CMakeLists.txt` | 1 | 0 |
 | `ggml/include/ggml-alloc.h` | 4 | 0 |
-| `ggml/include/ggml-backend.h` | 58 | 0 |
-| `ggml/include/ggml-cuda.h` | 34 | 0 |
+| `ggml/include/ggml-backend.h` | 46 | 0 |
+| `ggml/include/ggml-cuda.h` | 35 | 0 |
 | `ggml/include/ggml-rpc.h` | 2 | 2 |
 | `ggml/include/ggml.h` | 158 | 1 |
 | `ggml/src/CMakeLists.txt` | 2 | 0 |
 | `ggml/src/ggml-alloc.c` | 38 | 2 |
 | `ggml/src/ggml-backend-impl.h` | 5 | 0 |
 | `ggml/src/ggml-backend-meta.cpp` | 29 | 1 |
-| `ggml/src/ggml-backend.cpp` | 413 | 64 |
+| `ggml/src/ggml-backend.cpp` | 355 | 16 |
 | `ggml/src/ggml-blas/ggml-blas.cpp` | 1 | 0 |
 | `ggml/src/ggml-cann/ggml-cann.cpp` | 1 | 0 |
 | `ggml/src/ggml-common.h` | 1 | 0 |
-| `ggml/src/ggml-cpu/CMakeLists.txt` | 7 | 0 |
+| `ggml/src/ggml-cpu/CMakeLists.txt` | 6 | 0 |
 | `ggml/src/ggml-cpu/arch/arm/quants.c` | 0 | 1 |
 | `ggml/src/ggml-cpu/arch/x86/quants.c` | 138 | 7 |
-| `ggml/src/ggml-cpu/ggml-cpu.c` | 3708 | 3650 |
-| `ggml/src/ggml-cpu/ggml-cpu.cpp` | 141 | 6 |
+| `ggml/src/ggml-cpu/ggml-cpu.c` | 3711 | 3650 |
+| `ggml/src/ggml-cpu/ggml-cpu.cpp` | 143 | 6 |
 | `ggml/src/ggml-cpu/ops.cpp` | 751 | 12 |
 | `ggml/src/ggml-cpu/ops.h` | 6 | 0 |
 | `ggml/src/ggml-cpu/quants.c` | 1 | 0 |
 | `ggml/src/ggml-cpu/quants.h` | 7 | 0 |
 | `ggml/src/ggml-cpu/unary-ops.cpp` | 271 | 1 |
 | `ggml/src/ggml-cpu/unary-ops.h` | 3 | 0 |
-| `ggml/src/ggml-cuda/CMakeLists.txt` | 5 | 0 |
+| `ggml/src/ggml-cuda/CMakeLists.txt` | 11 | 0 |
 | `ggml/src/ggml-cuda/argsort.cu` | 93 | 71 |
 | `ggml/src/ggml-cuda/argsort.cuh` | 6 | 0 |
 | `ggml/src/ggml-cuda/binbcast.cu` | 12 | 2 |
@@ -95,7 +96,7 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `ggml/src/ggml-cuda/fattn-common.cuh` | 35 | 7 |
 | `ggml/src/ggml-cuda/fattn.cu` | 10 | 0 |
 | `ggml/src/ggml-cuda/fattn.cuh` | 3 | 0 |
-| `ggml/src/ggml-cuda/ggml-cuda.cu` | 1498 | 132 |
+| `ggml/src/ggml-cuda/ggml-cuda.cu` | 1519 | 131 |
 | `ggml/src/ggml-cuda/mmq.cu` | 54 | 3 |
 | `ggml/src/ggml-cuda/mmq.cuh` | 28 | 10 |
 | `ggml/src/ggml-cuda/mmvf.cu` | 22 | 0 |
@@ -141,12 +142,12 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `src/CMakeLists.txt` | 20 | 0 |
 | `src/llama-arch.cpp` | 168 | 2 |
 | `src/llama-arch.h` | 109 | 2 |
-| `src/llama-context.cpp` | 1316 | 45 |
-| `src/llama-context.h` | 148 | 2 |
+| `src/llama-context.cpp` | 1216 | 46 |
+| `src/llama-context.h` | 104 | 2 |
 | `src/llama-cparams.h` | 9 | 0 |
 | `src/llama-ext.h` | 16 | 0 |
-| `src/llama-graph.cpp` | 760 | 50 |
-| `src/llama-graph.h` | 158 | 5 |
+| `src/llama-graph.cpp` | 747 | 50 |
+| `src/llama-graph.h` | 161 | 5 |
 | `src/llama-hparams.cpp` | 21 | 0 |
 | `src/llama-hparams.h` | 73 | 1 |
 | `src/llama-impl.h` | 35 | 0 |
@@ -158,12 +159,12 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `src/llama-memory-recurrent.cpp` | 41 | 1 |
 | `src/llama-memory-recurrent.h` | 2 | 0 |
 | `src/llama-memory.h` | 70 | 0 |
-| `src/llama-mmap.cpp` | 150 | 10 |
-| `src/llama-mmap.h` | 7 | 0 |
-| `src/llama-model-loader.cpp` | 164 | 7 |
-| `src/llama-model-loader.h` | 39 | 0 |
+| `src/llama-mmap.cpp` | 206 | 10 |
+| `src/llama-mmap.h` | 13 | 0 |
+| `src/llama-model-loader.cpp` | 165 | 11 |
+| `src/llama-model-loader.h` | 40 | 0 |
 | `src/llama-model-saver.cpp` | 9 | 2 |
-| `src/llama-model.cpp` | 1077 | 39 |
+| `src/llama-model.cpp` | 1084 | 39 |
 | `src/llama-model.h` | 107 | 0 |
 | `src/llama-quant.cpp` | 22 | 1 |
 | `src/llama-sampler.cpp` | 1 | 0 |
@@ -176,14 +177,16 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `src/models/qwen35.cpp` | 2 | 2 |
 | `src/models/qwen35moe.cpp` | 8 | 2 |
 | `src/models/qwen3next.cpp` | 2 | 2 |
-| `tools/server/CMakeLists.txt` | 13 | 5 |
+| `tools/server/CMakeLists.txt` | 15 | 5 |
 | `tools/server/server-chat.cpp` | 66 | 16 |
-| `tools/server/server-common.cpp` | 288 | 5 |
-| `tools/server/server-common.h` | 22 | 1 |
-| `tools/server/server-context.cpp` | 685 | 127 |
+| `tools/server/server-common.cpp` | 354 | 16 |
+| `tools/server/server-common.h` | 27 | 2 |
+| `tools/server/server-context.cpp` | 798 | 148 |
+| `tools/server/server-context.h` | 7 | 1 |
 | `tools/server/server-task.cpp` | 195 | 183 |
-| `tools/server/server-task.h` | 23 | 80 |
+| `tools/server/server-task.h` | 28 | 80 |
+| `tools/server/server.cpp` | 1 | 0 |
 | `tools/server/tests/utils.py` | 2 | 2 |
 
-Total: 17577 added, 5686 removed across 153 upstream paths.
+Total: 17867 added, 5678 removed across 156 upstream paths.
 <!-- END UPSTREAM INVENTORY -->

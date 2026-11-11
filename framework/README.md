@@ -43,9 +43,8 @@ at that moment, the launch chooses thread counts, CPU placement, `place.costs`
 and, for an engine with CUDA but no usable CUDA GPU, `vram.budget = 0` (on macOS also
 `host.budget_mib` from the runtime policy). With an engine that has CUDA and one usable
 CUDA GPU it
-also chooses `prefill.cpu_max_tokens`, the longest prompt pass the CPU prefills
-no slower than the GPU graph, and prefills each prompt in one pass (`-b` and
-`-ub` as large as the context); on a GPU that shares host memory it keeps
+prefills each prompt in one pass (`-b` and `-ub` as large as the context), on
+the engine's SSD sink like every pass; on a GPU that shares host memory it keeps
 `host.headroom_mib = 4096`. It fills only settings left at their registry
 defaults and thread options and sizes not given, so explicit values always win.
 The choices are written to the generated `settings.ssd` with `source=strategy`
@@ -145,7 +144,8 @@ contract.
 ## How serve and cli run the server
 
 `inferssd serve` and `cli` resolve the launch for Linux, macOS or Windows from the live
-machine, then start one supervised server on a loopback port. Each launch writes
+machine, then start one supervised server on a loopback port, or for `serve`
+on the IPv4 address `--host` gives. Each launch writes
 a resource policy for the whole machine, `memory_budget_bytes` set to its
 physical memory, and claims a new run directory under
 `~/.local/share/inferssd/state/runs`.

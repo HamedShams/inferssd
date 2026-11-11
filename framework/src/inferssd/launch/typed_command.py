@@ -21,8 +21,16 @@ from typing import Optional
 from inferssd.configuration.settings import PLATFORMS, cpus, host_platform
 from inferssd.launch.prepare import prepare
 from inferssd.launch.recorded import RecordedArtifacts, run_indexer
-from inferssd.launch.resources import read_resources
-from inferssd.launch.typed import BATCH, CONTEXT, PROFILES, LaunchSpec, resolve_typed
+from inferssd.launch.resources import cache_directory, read_resources
+from inferssd.launch.typed import (
+    BATCH,
+    CONTEXT,
+    LOOPBACK,
+    PROFILES,
+    LaunchSpec,
+    listen_host,
+    resolve_typed,
+)
 from inferssd.launch.types import LaunchInput, Output, Threads
 from inferssd.machine.characteristics import dumps, load
 from inferssd.platform.policy import Policy
@@ -67,6 +75,12 @@ def add_arguments(launch: argparse.ArgumentParser) -> None:
         "--profile",
         choices=tuple(PROFILES),
         help="model profile (default: the one for the GGUF's general.architecture)",
+    )
+    launch.add_argument(
+        "--host",
+        default=LOOPBACK,
+        help="IPv4 address the server listens on: 127.0.0.1 (default) is this machine only, "
+        "0.0.0.0 every network interface",
     )
     launch.add_argument("--port", type=int, default=8080)
     launch.add_argument("--context", type=int, help=f"-c (default: {CONTEXT})")
@@ -118,13 +132,7 @@ def add_arguments(launch: argparse.ArgumentParser) -> None:
 
 def prompt_cache_directory() -> Path:
     """This user's cache directory for inferssd prompt caches."""
-    if sys.platform == "darwin":
-        root = Path.home() / "Library" / "Caches"
-    elif sys.platform == "win32":
-        root = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
-    else:
-        root = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
-    return root / "inferssd" / "prompts"
+    return cache_directory() / "prompts"
 
 
 def specification(args: argparse.Namespace, *, strategy: bool = False) -> LaunchSpec:
@@ -151,6 +159,7 @@ def specification(args: argparse.Namespace, *, strategy: bool = False) -> Launch
         None
         if args.prompt_cache == "off"
         else str(Path(args.prompt_cache or prompt_cache_directory()).resolve()),
+        listen_host(args.host),
     )
 
 
@@ -215,6 +224,7 @@ def run(args: argparse.Namespace) -> int:
             platform=args.platform,
             directory=str(claim.directory),
             memory=policy.memory_budget_bytes,
+            reserve=policy.host_reserve_bytes or 0,
         ),
         observe=adapter,
         emit=emit,

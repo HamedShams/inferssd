@@ -84,7 +84,7 @@ HOST_FACTS = frozenset(
     "gpu_available ss_available systemd cgroup_v2 user_manager memory_controller euid "
     "memory_kib filesystem gpu_memory gpu_processes port_busy scope_suffix "
     "platform_system platform_machine default_threads physical_memory disk_free "
-    "runtime_facts model_drive_key engine_gpu_backends".split()
+    "runtime_facts model_drive_key engine_gpu_backends cpu_topology".split()
 )
 
 
@@ -99,17 +99,20 @@ class LiveArtifacts:
         python: str,
         machine: Optional[str] = None,
         strategy_host: Optional[strategy_inputs.Host] = None,
+        index_cache: Optional[Path] = None,
     ) -> None:
         """MACHINE: the characteristics text the launch strategy derives from, if any.
 
         STRATEGY_HOST reads the strategy's runtime facts; by default this host,
-        with the launch's environment.
+        with the launch's environment. INDEX_CACHE keeps expert indexes for later launches.
         """
         self.inputs, self.host = inputs, host
         self.run, self.replace, self.python = run, replace, python
         self.machine = machine
         self.strategy_host = strategy_host or strategy_inputs.NativeHost(dict(inputs.environment))
-        self.artifacts = RecordedArtifacts(inputs, {}, run=run, replace=replace, python=python)
+        self.artifacts = RecordedArtifacts(
+            inputs, {}, run=run, replace=replace, python=python, index_cache=index_cache
+        )
 
     def __call__(self, fact: Fact) -> Reply:
         if fact.name == "machine_characteristics":
@@ -198,6 +201,10 @@ class LiveArtifacts:
         if name == "runtime_facts":
             facts = strategy_inputs.read_runtime(host=self.strategy_host)
             return strategy_inputs.runtime_facts_json(facts)
+        if name == "cpu_topology":
+            from inferssd.machine.profile import TOPOLOGY
+
+            return TOPOLOGY[self.strategy_host.platform()][1](self.strategy_host)
         if name == "model_drive_key":
             return strategy_inputs.model_drive_key(args, self.strategy_host)
         if name == "engine_gpu_backends":

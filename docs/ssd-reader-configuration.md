@@ -28,11 +28,12 @@ Debug observation is copied separately.
 The original untyped GPU creation ABI slot returns an explicit error. It remains
 non-null so older ABI discovery cannot dereference a missing function slot.
 
-The CPU reader emits versioned `ssd.io.read` and `ssd.place.layer` events after
+The CPU reader emits one versioned `ssd.place.layer` event a layer after
 completion and drain, including request/completion/pending counts, bytes, cache
-results, wall/wait/compute time and thread CPU time. A writer failure is returned
-to the caller. The context integration emits the initial effective settings and
-their sources; this reader module does not create another telemetry owner.
+results, wall/wait/compute time, thread CPU time and the layer's routes. A
+writer failure is returned to the caller. The context integration emits the
+initial effective settings and their sources; this reader module does not
+create another telemetry owner.
 
 ## Fixture construction
 
@@ -44,9 +45,7 @@ policy directly from typed snapshots and do not consume these fixture objects.
 `fixture_inputs` is owned by each test invocation and passed through constructors
 and calls. CPU CTest matrix variants use `--fixture key=value`; unknown fields
 are rejected. The CTest matrix retains transport, split-CV, scheduler, replacement
-and allocation dimensions without process environment mutation. The retained
-cache-compute algorithm tests pass explicit algorithm objects; supported product
-configuration leaves that experiment off.
+and allocation dimensions without process environment mutation.
 
 The prefetch residency unit keeps its existing stand-in residency table and real
 CPU file reads. It is a decision-policy unit, not CUDA numerical or performance

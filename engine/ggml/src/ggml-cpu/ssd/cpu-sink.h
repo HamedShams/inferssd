@@ -4,7 +4,6 @@
 #include "ggml-ssd/gpu/source.h"
 #include "ggml-ssd/host/cache-stats.h"
 #include "ggml-ssd/host/cache-stats.h"
-#include "ggml-ssd/host/cache-policy.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -52,9 +51,19 @@ GGML_BACKEND_API void kimi_cpu_sink_destroy(struct kimi_cpu_sink * sink);
 GGML_BACKEND_API bool kimi_cpu_sink_call_open(struct kimi_cpu_sink * sink, int nth, char * error, size_t error_size);
 GGML_BACKEND_API void kimi_cpu_sink_call_close(struct kimi_cpu_sink * sink);
 GGML_BACKEND_API void kimi_cpu_sink_call_join(struct kimi_cpu_sink * sink, int ith, int nth);
+// The threads of a decode pool of `pool` that a decode graph runs on: all of them, less the CPUs the machine's other
+// work took over the decode tokens so far, so that no thread of the graph waits behind that work at a barrier;
+// `pool` where cpu.decode_participants fixes the count or the CPUs' busy time cannot be read. Call before the graph,
+// with no run in progress.
+GGML_BACKEND_API int kimi_cpu_sink_decode_threads(struct kimi_cpu_sink * sink, int pool);
 // Next-layer expert prefetch: the experts that `layer` is predicted to select,
 // best first, given before the decode run of the layer before it. Ignored when prefetch is off.
 GGML_BACKEND_API void kimi_cpu_sink_prefetch_hint(struct kimi_cpu_sink * sink, int32_t layer, const int32_t * experts, int n);
+// A grouped prefill's prediction of the next routed layer: the experts of `layer` that each of `ntokens` tokens is
+// predicted to select, `k` a token best first (token-major), given before the prefill call of the layer before it.
+// The read-ahead (prefill.lookahead) reads the experts it makes likely; ignored when that is off.
+GGML_BACKEND_API void kimi_cpu_sink_prefill_hint(struct kimi_cpu_sink * sink, int32_t layer, const int32_t * experts,
+    int ntokens, int k);
 
 // Configure while no run is in progress. Layer quotas are assigned in priority
 // order, up to max_experts_per_layer each; a final layer may receive a partial
@@ -88,6 +97,11 @@ GGML_BACKEND_API bool kimi_cpu_sink_cache_configure(
 GGML_BACKEND_API bool kimi_cpu_sink_cache_begin(
         struct kimi_cpu_sink * sink, uint64_t epoch, uint64_t token, bool decode,
         char * error, size_t error_size);
+// A request's prefill boundary: cache_begin with decode=false, which also opens a
+// new prefill phase when one is open. Repeated cache_begin(false) calls stay in an
+// open phase, and a prompt evaluated outside any request leaves its phase open.
+GGML_BACKEND_API bool kimi_cpu_sink_request_begin(
+        struct kimi_cpu_sink * sink, uint64_t epoch, char * error, size_t error_size);
 // Completes the phase transition after the scheduler reserve. decode=false
 // only disarms the prefill OOM reclaimer; decode=true also grows the optional
 // global VRAM tier. No-op when the elastic extension is unavailable or off.
@@ -108,10 +122,17 @@ GGML_BACKEND_API bool kimi_cpu_sink_vram_reserve_accumulator(
 // experts_used: the model's routed experts a token.
 GGML_BACKEND_API bool kimi_cpu_sink_vram_reserve(struct kimi_cpu_sink * sink, const struct ggml_tensor * const * experts,
         int n_layers, int experts_used, char * error, size_t error_size);
+// At load, after the load's passes, before any request: the expert caches filled from the drive. No request has named
+// an expert, so each layer's experts are taken in their order: the GPU tier's empty slots, shared alike among the
+// layers, take each layer's first experts, then the RAM cache's empty slots the next ones. What no request uses is as
+// good as an empty slot to whatever allocates later. A tier made at load on a discrete GPU first grows into the card
+// if its memory has settled in the load's passes. experts: up, gate and down of n routed layers.
+GGML_BACKEND_API bool kimi_cpu_sink_preload(struct kimi_cpu_sink * sink, const struct ggml_tensor * const * experts,
+        int n_layers, char * error, size_t error_size);
 GGML_BACKEND_API void kimi_cpu_sink_cache_get_stats(
         struct kimi_cpu_sink * sink, struct kimi_cpu_sink_cache_stats * stats);
 // Room in host memory for other memory about to be allocated, decided by the host-memory ledger
-// (kimi-host-ledger.h): `host_bytes` of host memory (host compute buffers, checkpoints, prompt-cache blobs) and
+// (ggml-ssd/host/ledger.h): `host_bytes` of host memory (host compute buffers, checkpoints, prompt-cache blobs) and
 // `device_bytes` of GPU memory (device compute buffers), which count only where the GPU allocates out of the same
 // DRAM. Both ledger terms, the envelope and the available memory less the floor, must still hold. On a unified-memory
 // GPU the GPU tier gives blocks back first, then RAM cache slots go. Returns false when either would still be
@@ -179,41 +200,6 @@ GGML_BACKEND_API bool kimi_cpu_sink_run_activation(
         const int32_t * ids, const float * weights, int nslots,
         const struct kimi_cpu_sink_activation * activation, float * output,
         struct kimi_cpu_sink_stats * stats, char * error, size_t error_size);
-
-// Optional shared-location provider. nullptr detaches at a serialized boundary.
-// Default absent; the placement owner installs its adapter once, not per token.
-struct kimi_cache_location_api;
-GGML_BACKEND_API bool kimi_cpu_sink_set_cache_locations(
-        struct kimi_cpu_sink *, const struct kimi_cache_location_api *, void *, char *, size_t);
-
-// Separate ABI: the original stats and run entry remain unchanged.
-struct kimi_cache_compute_stats {
-    struct kimi_cache_compute_plan plan;
-    uint32_t computed_mask;
-    uint32_t released_mask;
-    uint64_t route_visible_us;
-    uint64_t prepared_us;
-    uint64_t finished_us;
-    uint64_t baseline_miss_bytes;
-    uint64_t submitted_bytes;
-    uint64_t unused_read_bytes;
-    // Native slot: queue, submit begin/end, up/gate/down CQE, CPU begin/end.
-    // For registered VRAM jobs, the final pair is a batch submit-to-finish
-    // host envelope, not per-expert CUDA kernel timing (see trace vram_mask).
-    uint64_t events[16][8];
-    uint64_t completed_bytes[16];
-    float final_weights[16];
-};
-GGML_BACKEND_API bool kimi_cpu_sink_run_cache_compute(
-        struct kimi_cpu_sink * sink,
-        const struct ggml_tensor * up, const struct ggml_tensor * gate,
-        const struct ggml_tensor * down, const float * input,
-        const int32_t * ids, const float * weights, int nslots,
-        const int32_t * native_ids, const float * native_weights, int native_count,
-        float routed_scale, bool guarded, const struct kimi_cache_compute_config * config,
-        float situ_beta, float situ_linear_beta, float * output,
-        struct kimi_cpu_sink_stats * stats, struct kimi_cache_compute_stats * decision,
-        char * error, size_t error_size);
 
 #ifdef __cplusplus
 }

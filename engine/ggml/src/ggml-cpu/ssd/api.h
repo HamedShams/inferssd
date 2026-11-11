@@ -11,7 +11,7 @@
 // borrow it only while that backend stays loaded, just as for its other procs.
 namespace ssd { namespace cpu {
 struct api_v2 {
-    uint32_t version;   // 3: vram_reserve takes every routed layer's tensors
+    uint32_t version;   // 7: preload
     size_t size;
     decltype(&kimi_cpu_sink_source_size) source_size;
     decltype(&create_configured) create;
@@ -21,14 +21,18 @@ struct api_v2 {
     decltype(&kimi_cpu_sink_call_open) call_open;
     decltype(&kimi_cpu_sink_call_close) call_close;
     decltype(&kimi_cpu_sink_call_join) call_join;
+    decltype(&kimi_cpu_sink_decode_threads) decode_threads;
     decltype(&kimi_cpu_sink_cache_configure) cache_configure;
     decltype(&kimi_cpu_sink_cache_begin) cache_begin;
+    decltype(&kimi_cpu_sink_request_begin) request_begin;
     decltype(&kimi_cpu_sink_vram_phase_complete) vram_phase_complete;
     decltype(&kimi_cpu_sink_cache_get_stats) cache_get_stats;
     decltype(&cache_make_room_configured) cache_make_room;
     decltype(&cache_prefill_room_configured) cache_prefill_room;
     decltype(&kimi_cpu_sink_prefetch_hint) prefetch_hint;
+    decltype(&kimi_cpu_sink_prefill_hint) prefill_hint;
     decltype(&kimi_cpu_sink_vram_reserve) vram_reserve;
+    decltype(&kimi_cpu_sink_preload) preload;
     decltype(&kimi_cpu_prefill_create) prefill_create;
     decltype(&kimi_cpu_prefill_run) prefill_run;
     decltype(&kimi_cpu_prefill_run_activation) prefill_run_activation;
@@ -43,22 +47,24 @@ using get_api_v2 = const api_v2 * (*)();
 
 // Check the prefix before accessing members from a possibly different build.
 inline bool valid(const api_v2 * api) noexcept {
-    return api && api->version == 3 && api->size == sizeof(api_v2) &&
+    return api && api->version == 7 && api->size == sizeof(api_v2) &&
         api->runtime_services_size == sizeof(runtime_services) &&
         api->source_size &&
         api->create &&
         api->run &&
         api->run_activation &&
         api->destroy &&
-        api->call_open && api->call_close && api->call_join &&
+        api->call_open && api->call_close && api->call_join && api->decode_threads &&
         api->cache_configure &&
-        api->cache_begin &&
+        api->cache_begin && api->request_begin &&
         api->vram_phase_complete &&
         api->cache_get_stats &&
         api->cache_make_room &&
         api->cache_prefill_room &&
         api->prefetch_hint &&
+        api->prefill_hint &&
         api->vram_reserve &&
+        api->preload &&
         api->prefill_create &&
         api->prefill_run &&
         api->prefill_run_activation &&

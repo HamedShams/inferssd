@@ -141,7 +141,7 @@ static bool ggml_cuda_memory_is_unified(int device);
 // Device memory a new allocation can still get. On a unified-memory GPU (DGX Spark, Jetson) device
 // allocations come out of system memory and cudaMemGetInfo reports MemFree, which leaves out the
 // reclaimable page cache, so the answer is MemAvailable there, as it reads at the kernel's full watermark
-// boost (kimi-memory-boost.h): a reserve kept on MemAvailable must survive the boost coming back.
+// boost (ggml-ssd/host/budget-linux.h): a reserve kept on MemAvailable must survive the boost coming back.
 static void ggml_cuda_memory_info(int device, size_t * free, size_t * total);
 
 // Memory that allocations must leave free, explicitly set by the typed tier
@@ -1185,19 +1185,16 @@ static bool ggml_backend_buft_is_cuda(ggml_backend_buffer_type_t buft) {
     return buft->iface.get_name == ggml_backend_cuda_buffer_type_get_name;
 }
 
-static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
-    ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *)buft->context;
-
-    ggml_cuda_set_device(buft_ctx->device);
-
-    void * dev_ptr = nullptr;
-    cudaError_t err = cudaSuccess;
+// An allocation that runs out of device memory is retried once the registered OOM reclaimer gives memory back
+// (the VRAM tier's blocks), for as long as it does.
+template <typename Allocate>
+static cudaError_t ggml_cuda_alloc_reclaiming(int device, size_t size, Allocate && allocate) {
     uint64_t retries = 0;
     for (;;) {
-        const bool injected = ggml_cuda_oom_reclaimer_should_inject(buft_ctx->device);
-        err = injected ? cudaErrorMemoryAllocation : ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device);
+        const bool injected = ggml_cuda_oom_reclaimer_should_inject(device);
+        const cudaError_t err = injected ? cudaErrorMemoryAllocation : allocate();
         if (err == cudaSuccess) {
-            break;
+            return err;
         }
         // Clear the failed allocation before the callback calls cudaFree.
         if (!injected) {
@@ -1205,18 +1202,43 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
         }
         size_t freed_bytes = 0;
         const int reclaimed = err == cudaErrorMemoryAllocation ?
-            ggml_cuda_oom_reclaimer_invoke(buft_ctx->device, size, &freed_bytes) : 0;
+            ggml_cuda_oom_reclaimer_invoke(device, size, &freed_bytes) : 0;
         if (reclaimed > 0 && freed_bytes > 0) {
             ++retries;
             GGML_LOG_WARN(
                 "%s: device %d allocation %.2f MiB OOM; reclaimer freed %.2f MiB, retry=%" PRIu64 "%s\n",
-                __func__, buft_ctx->device, size / 1024.0 / 1024.0,
+                __func__, device, size / 1024.0 / 1024.0,
                 freed_bytes / 1024.0 / 1024.0, retries, injected ? " injected=1" : "");
             continue;
         }
         if (reclaimed < 0) {
-            GGML_LOG_ERROR("%s: device %d OOM reclaimer failed closed\n", __func__, buft_ctx->device);
+            GGML_LOG_ERROR("%s: device %d OOM reclaimer failed closed\n", __func__, device);
         }
+        return err;
+    }
+}
+
+// Device memory outside ggml's buffers (backend-functions.h): admitted against the reserve and retried after the OOM
+// reclaimer gives memory back, as a backend buffer's allocation is. The caller reports what it holds and frees it with
+// cudaFree.
+extern "C" cudaError_t ggml_cuda_malloc_reclaiming(void ** ptr, size_t size, int device) {
+    ggml_cuda_set_device(device);
+    *ptr = nullptr;
+    return ggml_cuda_alloc_reclaiming(device, size, [&] {
+        const cudaError_t err = ggml_cuda_reserve_memory(device, size);
+        return err == cudaSuccess ? cudaMalloc(ptr, size) : err;
+    });
+}
+
+static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *)buft->context;
+
+    ggml_cuda_set_device(buft_ctx->device);
+
+    void * dev_ptr = nullptr;
+    const cudaError_t err = ggml_cuda_alloc_reclaiming(buft_ctx->device, size,
+        [&] { return ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device); });
+    if (err != cudaSuccess) {
         GGML_LOG_ERROR("%s: allocating %.2f MiB on device %d: cudaMalloc failed: %s\n", __func__, size / 1024.0 / 1024.0, buft_ctx->device, cudaGetErrorString(err));
         return nullptr;
     }
@@ -5998,7 +6020,7 @@ static bool ggml_backend_cuda_get_available_uma_memory(long * available_memory_k
 }
 
 // How far MemAvailable can still fall with nothing allocated, as the kernel raises the zones' watermark boosts to their
-// largest (kimi-memory-boost.h); 0 when a file cannot be read.
+// largest (ggml-ssd/host/budget-linux.h); 0 when a file cannot be read.
 static size_t ggml_cuda_uma_boost_headroom() {
     auto slurp = [](const char * path, std::string & text) {
         FILE * file = fopen(path, "r");

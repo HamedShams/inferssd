@@ -26,11 +26,6 @@ struct kimi_cpu_prefill_stats {
     uint64_t gpu_ssd_transient_upload_bytes;
     double gpu_ssd_transient_upload_us;
     double gpu_worker_us;              // resident + transient GPU worker wall
-    uint64_t gpu_cold_admit_candidates; // SSD candidates meeting the cold Q2 gate
-    uint64_t gpu_cold_admit_experts;    // successfully seeded empty decode slots
-    uint64_t gpu_cold_admit_routes;
-    uint64_t gpu_cold_admit_upload_bytes;
-    double gpu_cold_admit_upload_us;
     uint64_t ram_experts;              // distinct read-only retained RAM hits
     uint64_t ram_routes;               // token/slot routes sourced from retained RAM
     uint64_t ram_bytes;
@@ -51,8 +46,9 @@ GGML_BACKEND_API void kimi_cpu_prefill_destroy(struct kimi_cpu_prefill * prefill
 // activation requirements match kimi_cpu_sink_run_activation. Every distinct
 // live expert is read once. Each token's routes are added in slot order from its
 // first live slot's product, as the graph does, for every batch size; the route
-// workspace (about ntokens * nslots * latent floats) must fit 512 MiB, or the run
-// fails before any read. Negative IDs are skipped. On failure discard output; no
+// workspace (about ntokens * nslots * latent floats) is priced to the sink's
+// host-memory ledger as it grows, and a run whose envelope cannot hold it fails
+// before any read. Negative IDs are skipped. On failure discard output; no
 // hidden mmap/GPU fallback is attempted and in-flight reads are drained.
 GGML_BACKEND_API bool kimi_cpu_prefill_run_activation(
         struct kimi_cpu_prefill * prefill,

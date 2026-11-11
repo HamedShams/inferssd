@@ -1252,6 +1252,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     n_outputs        (params.n_outputs),
     cpu_sink_decode  (params.cpu_sink_decode),
     cpu_sink_prefill (params.cpu_sink_prefill),
+    cpu_sink_prefill_hint (params.cpu_sink_prefill_hint),
     cpu_sink_runtime (params.cpu_sink_runtime),
     n_ctx_orig       (cparams.n_ctx_orig_yarn),
     pooling_type     (cparams.pooling_type),
@@ -1631,7 +1632,7 @@ ggml_tensor * llm_graph_context::build_moe_prefetch_hint(
 llama_expert_gating_func_type gating_op,
              int64_t   n_expert,
                  int   il) {
-    if (!cpu_sink_runtime || n_tokens != 1 || !next_gate_inp) {
+    if (!cpu_sink_runtime || !next_gate_inp || !(cpu_sink_prefill ? cpu_sink_prefill_hint : n_tokens == 1)) {
         return nullptr;
     }
     // a router that reads the stream as it is has no norm of its own
@@ -1886,13 +1887,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         weights = ggml_reshape_3d(ctx0, weights, 1, n_expert_used, n_tokens);
     }
 
-    // Capture native top-16 before S masking/reordering. No expert payload is
-    // added to the graph and the disabled graph keeps its original sources.
-    const bool cache_compute = cpu_sink_decode && n_tokens == 1 && cpu_sink_runtime &&
-        cpu_sink_runtime->cache_compute_enabled;
-    ggml_tensor * native_experts = cache_compute ? selected_experts : nullptr;
-    ggml_tensor * native_weights = cache_compute ? weights : nullptr;
-
     if (expert_hard_reduction || expert_mass_reduction) {
         GGML_ASSERT(expert_mass_threshold <= 1.0f);
         GGML_ASSERT(!expert_mass_reduction ||
@@ -2052,7 +2046,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             backend_cpu != nullptr, cpu_sink_runtime != nullptr, up_exps, gate_exps, down_exps,
             gate_up_exps, gate_up_exps_b, gate_inp_b, up_exps_b, gate_exps_b, down_exps_b,
             up_exps_s, gate_exps_s, down_exps_s, n_embd, n_tokens, type_op == LLM_FFN_SILU,
-            cache_compute, cpu_sink_prefill, weight_before_ffn, loras && !loras->empty(),
+            cpu_sink_prefill, weight_before_ffn, loras && !loras->empty(),
             post_exp_norm, post_exp_norm_eps, w_scale};
         const auto adapted = llama_ssd::validate_experts(requirements, inputs);
         if (!adapted.accepted()) {
@@ -2085,26 +2079,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         descriptor->post_exp_norm_eps = execution.post_norm_eps;
         descriptor->layer = il;
         descriptor->prefill = cpu_sink_prefill;
-        descriptor->cache_compute = cache_compute;
-        descriptor->routed_scale = execution.routed_scale;
-        ggml_tensor * hint = !cache_compute && !cpu_sink_prefill && n_tokens == 1 ? cpu_sink_prefetch_hint : nullptr;
-        // slots: input, ids, weights, then the post-expert norm or the native ids and weights, then the hint
+        ggml_tensor * hint = cpu_sink_prefill || n_tokens == 1 ? cpu_sink_prefetch_hint : nullptr;
+        // slots: input, ids, weights, then the post-expert norm, then the hint
         ggml_tensor * args[] = {
             ggml_cont(ctx0, cur), ggml_cont(ctx0, selected_experts), ggml_cont(ctx0, weights),
-            post_exp_norm ? ggml_cont(ctx0, post_exp_norm) : cache_compute ? ggml_cont(ctx0, native_experts) : nullptr,
-            cache_compute ? ggml_cont(ctx0, native_weights) : nullptr,
+            post_exp_norm ? ggml_cont(ctx0, post_exp_norm) : nullptr,
             hint ? ggml_cont(ctx0, hint) : nullptr,
         };
-        if (cache_compute) {
-            cb(args[3], "ffn_moe_cpu_sink_native_ids", il);
-            cb(args[4], "ffn_moe_cpu_sink_native_weights", il);
-        }
         cb(args[0], "ffn_moe_cpu_sink_in", il);
         cb(args[1], "ffn_moe_cpu_sink_ids", il);
         cb(args[2], "ffn_moe_cpu_sink_weights", il);
         // every CPU thread of the graph is a compute participant of the node's call
         ggml_tensor * result = ggml_custom_4d(ctx0, GGML_TYPE_F32, n_embd, n_tokens, 1, 1,
-            args, hint ? 6 : cache_compute ? 5 : post_exp_norm ? 4 : 3, llama_kimi_cpu_sink_compute,
+            args, hint ? 5 : post_exp_norm ? 4 : 3, llama_kimi_cpu_sink_compute,
             GGML_N_TASKS_MAX, descriptor.get());
         res->cpu_sink_nodes.emplace_back(std::move(descriptor));
         cb(result, "ffn_moe_cpu_sink", il);

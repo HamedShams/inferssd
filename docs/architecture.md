@@ -38,15 +38,15 @@ The first successful graph containing a new weight-format pair, geometry, activa
 
 ## Threads
 
-CPU compute runs on one pool, ggml's threadpool, for dense and expert work alike. A sink node is an ordinary multi-threaded ggml op: every CPU-backend thread of the graph enters it, thread 0 opens a call for the node's thread count and runs the layer, and the other threads join the call as its compute participants until it closes. Each compute phase splits its rows over the participants, by atomic row chunks or explicit row weights; a decode phase uses the first N of them, where N is all of them or the number that fits the fastest CPU cluster, whichever measures faster, or `cpu.decode_participants`. Grouped prefill and the cache executor dispatch through the same phases. The participants take no lock: thread 0 publishes each phase in one atomic word, and the others poll it for up to 3 ms after a phase, then park on it through the OS's wait-on-address primitive, so one wake reaches all of them.
+CPU compute runs on one pool, ggml's threadpool, for dense and expert work alike. A sink node is an ordinary multi-threaded ggml op: every CPU-backend thread of the graph enters it, thread 0 opens a call for the node's thread count and runs the layer, and the other threads join the call as its compute participants until it closes. Each compute phase splits its rows over the participants, by atomic row chunks or explicit row weights; a decode phase uses all of them, or the first `cpu.decode_participants`. A call closes only once every thread of the node has joined it and ggml's barrier after the node waits for each one, so the launch sizes the decode pool to the fewest threads that stream the experts' weights at the best measured rate: past that, memory bandwidth adds nothing and each thread only adds a wait. Between decode tokens the sink also measures the busy time of the CPUs the process may run on that the graph's threads did not take (the GPU backend's threads, the reads, other processes): a decode graph then runs on the pool's threads less that many CPUs, rounded up, and the threads it leaves out wait without polling, since another thread taking a graph thread's CPU would hold that layer's barrier. Grouped prefill and the cache executor dispatch through the same phases. The participants take no lock: thread 0 publishes each phase in one atomic word, and the others poll it for up to 3 ms after a phase, then park on it through the OS's wait-on-address primitive, so one wake reaches all of them.
 
 Placement is ggml's. `-t` and `-tb` set the decode and batch thread counts, `-C` and `-Cb` their CPU masks, and `--cpu-strict` and `--cpu-strict-batch` place thread i on the i-th CPU of its mask in increasing order; `--prio` and `--poll` set priority and polling. The sink keeps only its own I/O thread, its prefetch readers and, on unified memory, a watch thread, all placed by `cpu.io_cpus`.
 
-The CUDA cache tier's worker and upload threads run with thread 0, which waits for them: the sink gives the tier thread 0's CPUs at its first layer on the tier and again whenever they change, so with `--cpu-strict` they share thread 0's core.
+Thread 0 launches a decode layer's work on the CUDA cache tier itself. The tier's worker and upload threads run on the process's CPUs other than thread 0's (all of them when none is left), set at the tier's first layer and again whenever thread 0's change.
 
 ## Batching
 
-Prompt batching lets tokens share weight access. The launch strategy sets the native batch and micro-batch capacities. Each launch's settings stay fixed while it runs; the engine itself sizes its caches and decode threads to the machine as it goes. A run's native events record placement and prefill; see [native observations](architecture/native-observations.md). The settings used in the recorded Mac benchmark runs are listed in [benchmark methodology](benchmark.md#engine-configurations).
+Prompt batching lets tokens share weight access. The launch strategy sets the native batch and micro-batch capacities. Each launch's settings stay fixed while it runs; the engine itself sizes its caches to the machine as it goes. A run's native events record placement and prefill; see [native observations](architecture/native-observations.md). The settings used in the recorded Mac benchmark runs are listed in [benchmark methodology](benchmark.md#engine-configurations).
 
 ## Modules
 
@@ -58,7 +58,7 @@ The runtime extends the bundled llama.cpp snapshot. Its integration points are l
 | Core | `engine/ggml/src/ggml-ssd/io` | One read ring per OS (io_uring through system calls, IoRing, reader threads), an instance per reader; portable pread |
 | Core | `engine/ggml/src/ggml-ssd/host` | Process host arbiter, per-context leases, expert cache and page accounting |
 | Core | `engine/ggml/src/ggml-ssd/place` | Shared placement cost evaluation, learning state and prefetch decisions |
-| Core | `engine/ggml/src/ggml-ssd/stream` | Expert ranges, dense lookahead, seed ordering and copy observations |
+| Core | `engine/ggml/src/ggml-ssd/stream` | Copies of the dense weights homed on the drive, their lookahead and observations |
 | Core | `engine/ggml/src/ggml-ssd/settings`, `telemetry` | Immutable validated settings, source receipts and owned JSONL writers |
 | Executors | `engine/ggml/src/ggml-cpu/ssd`, `engine/ggml/src/ggml-cuda/ssd` | CPU scheduling and compute; CUDA tier, staging, events and format kernels |
 | Runtime | `engine/src/ssd` | Context assembly, backend registry binding, model sources, model adaptation, graph admission and diagnostics |
@@ -79,13 +79,13 @@ Run `python3 scripts/inferssd/check-layering.py` to check these boundaries.
 
 ## Runtime ownership
 
-The context owns sources, host registration, the telemetry writer, transport and diagnostics; executors borrow them. Graph failure fences outstanding seed consumers before reset. A precompute transaction restores touched and purged KV metadata without allocating, and it ends before compute submission. Stateful memory that cannot roll back a submitted failure clears the affected sequences for checkpoint restore or replay. Backend destruction quiesces transport before destroying CUDA streams. The writer and source descriptors close after all borrowers stop.
+The context owns sources, host registration, the telemetry writer, transport and diagnostics; executors borrow them. A precompute transaction restores touched and purged KV metadata without allocating, and it ends before compute submission. Stateful memory that cannot roll back a submitted failure clears the affected sequences for checkpoint restore or replay. Backend destruction quiesces transport before destroying CUDA streams. The writer and source descriptors close after all borrowers stop.
 
 Allocation admission precedes allocation and first touch; committed allocations invalidate learning intervals when they are later freed or replaced. An admission that does not fit first has the context's expert caches give room back: the executor registers their reclaimer with the context's host client, so every allocation, including the CPU backend's work buffer, gets that room without asking for it. Linux uses finite cgroup constraints; macOS and Windows use the process envelope described in [configuration](configuration.md).
 
 ## Settings and deployment
 
-Production configuration uses the typed `inferssd-settings 1` format described in [configuration](configuration.md). Retired environment names are rejected by name without reporting their values. Only `INFERSSD_DEBUG` and `INFERSSD_TRACE_DIR` are observation channels, and trace or profile output requires an owned telemetry writer. Options inherited from llama.cpp keep their upstream behavior.
+Production configuration uses the typed `inferssd-settings 1` format described in [configuration](configuration.md). Retired environment names are rejected by name without reporting their values. Only `INFERSSD_DEBUG` and `INFERSSD_TRACE_DIR` are observation channels, and trace or profile output requires an owned telemetry writer. The server's `INFERSSD_USAGE_DIR` selects where it records [usage events](usage-events.md) for its host. Options inherited from llama.cpp keep their upstream behavior.
 
 Deployment paths and capabilities are declared as explicit [engine resources](engine-resources.md), so the installed framework needs no source checkout. Native probes live in `engine/tools/inferssd-probe` and run only when requested.
 
