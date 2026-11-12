@@ -307,6 +307,19 @@ def test_cached_files_without_room_for_the_test_file_fail_the_drive(tmp_path):
     assert host.test_files == [] and value["storage"] == []
 
 
+def test_a_killed_runs_test_file_beside_cached_files_is_removed(tmp_path):
+    host, files = linux_machine(tmp_path)
+    child = subprocess.Popen([sys.executable, "-c", ""])
+    child.wait()
+    left = os.path.join(os.path.dirname(files[1]), f".inferssd-drive-test-{child.pid}-x")
+    with open(left, "wb") as stream:
+        stream.truncate(4 * GIB)
+    value, _ = run(host, files, CachedFilesRunner(replies()))
+    ((test_file, _, _),) = host.test_files
+    assert test_file != left and not os.path.exists(left)
+    assert value["sections"]["storage:" + nvme_key()]["status"] == "ok"
+
+
 def test_a_killed_runs_test_file_is_neither_read_nor_kept(tmp_path):
     host, _ = linux_machine(tmp_path)
     empty = tmp_path / "models" / "empty"

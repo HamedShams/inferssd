@@ -507,10 +507,13 @@ def measure_drive(
             # failed it again until the pages were evicted.
             progress("SSD probe: every given file is in the page cache; measuring in a test file")
             os_path = ntpath if host.platform() == "windows" else posixpath
+            directory = os_path.dirname(chosen[0])
+            # No given directory clears a test file a killed run left beside the model.
+            host.clear_test_files(directory)
             return _test_file_rates(
                 host,
                 drive,
-                os_path.dirname(chosen[0]),
+                directory,
                 "every given file is in the page cache",
                 probes,
                 clock,
